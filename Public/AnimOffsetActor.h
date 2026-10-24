@@ -19,11 +19,6 @@ public:
 	// Sets default values for this actor's properties
 	AAnimOffsetActor();
 
-protected:
-	// Called when the game starts or when spawned
-	virtual void BeginPlay() override;
-
-
 	/** Camera to offset. If empty, the first CameraActor found in the level is used. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	TSoftObjectPtr<ACameraActor> TargetCamera;
@@ -67,8 +62,19 @@ protected:
 	TObjectPtr<UArrowComponent> Arrow;
 
 	ACameraActor* ResolveCamera() const;
-public:	
-	// Called every frame
-	virtual void Tick(float DeltaTime) override;
 
+
+#if WITH_EDITOR
+	virtual void PostActorCreated() override;
+	virtual void PostLoad() override;
+	virtual void BeginDestroy() override;
+
+private:
+	void RegisterSequencerHook();
+	void UnregisterSequencerHook();
+	void OnSequencerCreated(TSharedRef<class ISequencer> InSequencer);
+
+	FDelegateHandle SequencerCreatedHandle;
+#endif
 };
+

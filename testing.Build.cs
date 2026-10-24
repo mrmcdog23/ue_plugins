@@ -10,7 +10,13 @@ public class testing : ModuleRules
 
         PublicDependencyModuleNames.AddRange(new string[]
             {
-            "Core", "CoreUObject", "Engine", "InputCore", "LevelSequence", "MovieScene"
+                "Core",
+                "CoreUObject",
+                "Engine", 
+                "InputCore",
+                "LevelSequence", 
+                "MovieScene", 
+                "Sequencer"
             });
 
         PrivateDependencyModuleNames.AddRange(
@@ -25,16 +31,15 @@ public class testing : ModuleRules
             }
         );
         PrivateIncludePaths.AddRange(
-            new string[] {
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Source/Editor/Blutility/Private/",
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Plugins/MovieScene/LevelSequenceEditor/Source/LevelSequenceEditor/",
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Plugins/MovieScene/LevelSequenceEditor/Source/LevelSequenceEditor/Private/",
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Plugins/Interchange/Runtime/Source/Parsers/Fbx/Private/",
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Plugins/MovieScene/SequencerScripting/Source/SequencerScriptingEditor/Private/",
-                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Plugins/Experimental/ImagePlate/Source/ImagePlate/Private/"
-
-            }
+            new string[] {}
             );
+
+        PublicIncludePaths.AddRange(
+            new string[] {
+                System.IO.Path.GetFullPath(Target.RelativeEnginePath) + "/Source/Editor/Sequencer/Public/"
+                }
+            );
+
 
         // To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
     }

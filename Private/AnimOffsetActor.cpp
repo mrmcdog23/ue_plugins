@@ -6,12 +6,10 @@
 #include "Components/SceneComponent.h"
 #include "EngineUtils.h"
 
-#if WITH_EDITOR
 #include "ISequencerModule.h"
 #include "ISequencer.h"
 #include "Modules/ModuleManager.h"
 #include "Editor.h"
-#endif
 
 
 // Sets default values
@@ -97,16 +95,59 @@ void AAnimOffsetActor::ApplyOffsetNow()
 }
 
 
-// Called when the game starts or when spawned
-void AAnimOffsetActor::BeginPlay()
+void AAnimOffsetActor::PostActorCreated()
 {
-	Super::BeginPlay();
-
+	Super::PostActorCreated();
+	SetOriginToCurrent(); // wherever it is placed counts as zero offset
+	RegisterSequencerHook();
 }
 
-// Called every frame
-void AAnimOffsetActor::Tick(float DeltaTime)
+void AAnimOffsetActor::PostLoad()
 {
-	Super::Tick(DeltaTime);
+	Super::PostLoad();
+	RegisterSequencerHook();
+}
 
+void AAnimOffsetActor::BeginDestroy()
+{
+	UnregisterSequencerHook();
+	Super::BeginDestroy();
+}
+
+void AAnimOffsetActor::RegisterSequencerHook()
+{
+	if (HasAnyFlags(RF_ClassDefaultObject) || SequencerCreatedHandle.IsValid())
+	{
+		return;
+	}
+	ISequencerModule* SequencerModulePtr = FModuleManager::Get().GetModulePtr<ISequencerModule>("Sequencer");
+	if (SequencerModulePtr)
+	{
+		SequencerCreatedHandle = SequencerModulePtr->RegisterOnSequencerCreated(
+			FOnSequencerCreated::FDelegate::CreateUObject(this, &AAnimOffsetActor::OnSequencerCreated));
+	}
+}
+
+
+void AAnimOffsetActor::UnregisterSequencerHook()
+{
+	if (SequencerCreatedHandle.IsValid())
+	{
+		ISequencerModule* SequencerModulePtr = FModuleManager::Get().GetModulePtr<ISequencerModule>("Sequencer");
+		if (SequencerModulePtr)
+		{
+			SequencerModulePtr->UnregisterOnSequencerCreated(SequencerCreatedHandle);
+		}
+		SequencerCreatedHandle.Reset();
+	}
+}
+
+void AAnimOffsetActor::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
+{
+	if (!bMoveCameraOnSequenceOpen || !GetWorld() || GetWorld() != GEditor->GetEditorWorldContext().World())
+	{
+		return;
+	}
+
+	ApplyOffsetNow();
 }
