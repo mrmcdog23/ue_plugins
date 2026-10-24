@@ -6,9 +6,8 @@
 #include "GameFramework/Actor.h"
 #include "AnimOffsetActor.generated.h"
 
-class USceneComponent;
-class USkeletalMeshComponent;
-class UAnimSequenceBase;
+class ACameraActor;
+class UArrowComponent;
 
 
 UCLASS()
@@ -24,15 +23,50 @@ protected:
 	// Called when the game starts or when spawned
 	virtual void BeginPlay() override;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+
+	/** Camera to offset. If empty, the first CameraActor found in the level is used. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
+	TSoftObjectPtr<ACameraActor> TargetCamera;
+
+	/** Apply the offset automatically whenever a Level Sequence is opened. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
+	bool bMoveCameraOnSequenceOpen = true;
+
+	/** Also apply the actor's rotation offset (not just location). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
+	bool bApplyRotationOffset = true;
+
+	/** Actor transform that counts as "zero offset". Set automatically on placement. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor|State")
+	FTransform OriginTransform;
+
+	/** Camera transform that the offset is added to. Captured the first time it is applied. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor|State")
+	FTransform CameraBaseTransform;
+
+	UPROPERTY(VisibleAnywhere, Category = "Camera Anchor|State")
+	bool bHasCameraBase = false;
+
+	/** Apply the offset to the camera now. */
+	UFUNCTION(CallInEditor, Category = "Camera Anchor")
+	void ApplyOffsetNow();
+
+	/** Treat this actor's current transform as zero offset. */
+	UFUNCTION(CallInEditor, Category = "Camera Anchor")
+	void SetOriginToCurrent();
+
+	/** Treat the camera's current transform as its base (use after you reposition the camera yourself). */
+	UFUNCTION(CallInEditor, Category = "Camera Anchor")
+	void RecaptureCameraBase();
+
+protected:
+	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USceneComponent> Root;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
-	TObjectPtr<USkeletalMeshComponent> Mesh;
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UArrowComponent> Arrow;
 
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Animation")
-	TObjectPtr<UAnimSequenceBase> Animation;
-
+	ACameraActor* ResolveCamera() const;
 public:	
 	// Called every frame
 	virtual void Tick(float DeltaTime) override;

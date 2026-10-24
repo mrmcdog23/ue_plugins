@@ -21,6 +21,7 @@ public class testing : ModuleRules
                 "Engine",
                 "Slate",
                 "SlateCore",
+                "Sequencer",
             }
         );
         PrivateIncludePaths.AddRange(
