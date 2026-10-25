@@ -1,22 +1,25 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 #include "AnimOffsetActor.h"
-#include "Animation/AnimSequenceBase.h"
 #include "Camera/CameraActor.h"
 #include "Components/ArrowComponent.h"
 #include "Components/SceneComponent.h"
-#include "EngineUtils.h"
 
-#include "ISequencerModule.h"
-#include "ISequencer.h"
-#include "Modules/ModuleManager.h"
+#if WITH_EDITOR
+#include "Containers/Ticker.h"
 #include "Editor.h"
+#include "ISequencer.h"
+#include "ISequencerModule.h"
+#include "Modules/ModuleManager.h"
+#include "MovieScene.h"
+#include "MovieSceneSequence.h"
+#include "MovieSceneSpawnable.h"
+#endif
 
 
-// Sets default values
 AAnimOffsetActor::AAnimOffsetActor()
 {
- 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
 	PrimaryActorTick.bCanEverTick = false;
+
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	SetRootComponent(Root);
 
@@ -27,78 +30,11 @@ AAnimOffsetActor::AAnimOffsetActor()
 }
 
 
-ACameraActor* AAnimOffsetActor::ResolveCamera() const
-{
-	if (ACameraActor* Camera = TargetCamera.Get())
-	{
-		return Camera;
-	}
-
-	if (UWorld* World = GetWorld())
-	{
-		for (TActorIterator<ACameraActor> It(World); It; ++It)
-		{
-			return *It;
-		}
-	}
-	return nullptr;
-}
-
-
-void AAnimOffsetActor::SetOriginToCurrent()
-{
-	OriginTransform = GetActorTransform();
-	OriginTransform.SetScale3D(FVector::OneVector);
-}
-
-
-void AAnimOffsetActor::RecaptureCameraBase()
-{
-	if (ACameraActor* Camera = ResolveCamera())
-	{
-		CameraBaseTransform = Camera->GetActorTransform();
-		bHasCameraBase = true;
-	}
-}
-
-
-void AAnimOffsetActor::ApplyOffsetNow()
-{
-	ACameraActor* Camera = ResolveCamera();
-	if (!Camera)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: no camera found in level."));
-		return;
-	}
-
-	// Capture the camera's starting point once so repeated applies don't stack.
-	if (!bHasCameraBase)
-	{
-		RecaptureCameraBase();
-	}
-	
-	const FVector LocationOffset = GetActorLocation() - OriginTransform.GetLocation();
-	const FVector NewLocation = CameraBaseTransform.GetLocation() + LocationOffset;
-
-	FQuat NewRotation = CameraBaseTransform.GetRotation();
-	if (bApplyRotationOffset)
-	{
-		// Rotation the actor has turned by since its origin, applied on top of the camera's base rotation.
-		const FQuat RotationOffset = GetActorQuat() * OriginTransform.GetRotation().Inverse();
-		NewRotation = RotationOffset * CameraBaseTransform.GetRotation();
-	}
-
 #if WITH_EDITOR
-	Camera->Modify();
-#endif
-	Camera->SetActorLocationAndRotation(NewLocation, NewRotation);
-}
-
 
 void AAnimOffsetActor::PostActorCreated()
 {
 	Super::PostActorCreated();
-	SetOriginToCurrent(); // wherever it is placed counts as zero offset
 	RegisterSequencerHook();
 }
 
@@ -120,21 +56,20 @@ void AAnimOffsetActor::RegisterSequencerHook()
 	{
 		return;
 	}
-	ISequencerModule* SequencerModulePtr = FModuleManager::Get().GetModulePtr<ISequencerModule>("Sequencer");
-	if (SequencerModulePtr)
+
+	// LoadModulePtr (not GetModulePtr): Sequencer is often not loaded yet during PostLoad.
+	if (ISequencerModule* SequencerModulePtr = FModuleManager::LoadModulePtr<ISequencerModule>("Sequencer"))
 	{
 		SequencerCreatedHandle = SequencerModulePtr->RegisterOnSequencerCreated(
 			FOnSequencerCreated::FDelegate::CreateUObject(this, &AAnimOffsetActor::OnSequencerCreated));
 	}
 }
 
-
 void AAnimOffsetActor::UnregisterSequencerHook()
 {
 	if (SequencerCreatedHandle.IsValid())
 	{
-		ISequencerModule* SequencerModulePtr = FModuleManager::Get().GetModulePtr<ISequencerModule>("Sequencer");
-		if (SequencerModulePtr)
+		if (ISequencerModule* SequencerModulePtr = FModuleManager::Get().GetModulePtr<ISequencerModule>("Sequencer"))
 		{
 			SequencerModulePtr->UnregisterOnSequencerCreated(SequencerCreatedHandle);
 		}
@@ -144,10 +79,72 @@ void AAnimOffsetActor::UnregisterSequencerHook()
 
 void AAnimOffsetActor::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 {
-	if (!bMoveCameraOnSequenceOpen || !GetWorld() || GetWorld() != GEditor->GetEditorWorldContext().World())
+	if (!bMoveCameraOnSequenceOpen || !GEditor || GetWorld() != GEditor->GetEditorWorldContext().World())
 	{
 		return;
 	}
 
-	ApplyOffsetNow();
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sequencer opened, watching for spawned cameras."));
+
+	TWeakObjectPtr<AAnimOffsetActor> WeakThis(this);
+	TWeakPtr<ISequencer> WeakSequencer = InSequencer;
+
+	// Poll while this Sequencer is open, so cameras that get respawned are re-parented.
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis, WeakSequencer](float)
+		{
+			AAnimOffsetActor* Self = WeakThis.Get();
+			TSharedPtr<ISequencer> Sequencer = WeakSequencer.Pin();
+			if (!Self || !Sequencer.IsValid())
+			{
+				return false; // actor or Sequencer is gone, stop ticking
+			}
+
+			Self->AttachSpawnedCameras(*Sequencer);
+			return true; // keep running
+		}), 0.1f);
 }
+
+
+void AAnimOffsetActor::AttachSpawnedCameras(ISequencer& InSequencer)
+{
+	UE_LOG(LogTemp, Warning, TEXT("AttachSpawnedCameras: attached level camera"));
+	UMovieSceneSequence* Sequence = InSequencer.GetFocusedMovieSceneSequence();
+	UMovieScene* MovieScene = Sequence ? Sequence->GetMovieScene() : nullptr;
+	if (!MovieScene)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("No movie scene found."));
+		return;
+	}
+
+	UE_LOG(LogTemp, Verbose, TEXT("CameraAnchor: '%s' spawnables=%d possessables=%d bindings=%d"),
+		*Sequence->GetName(), MovieScene->GetSpawnableCount(),
+		MovieScene->GetPossessableCount(), MovieScene->GetBindings().Num());
+
+	for (const FMovieSceneBinding& Binding : MovieScene->GetBindings())
+	{
+		const FGuid BindingId = Binding.GetObjectGuid();
+
+		for (TWeakObjectPtr<> Object : InSequencer.FindBoundObjects(BindingId, InSequencer.GetFocusedTemplateID()))
+		{
+			UObject* Bound = Object.Get();
+			if (!Bound)
+			{
+				continue;
+			}
+
+			ACameraActor* Camera = Cast<ACameraActor>(Bound);
+			if (!Camera)
+			{
+				continue; // not a camera actor, ignore silently
+			}
+
+			if (Camera->GetAttachParentActor() != this)
+			{
+				Camera->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
+				UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: attached '%s' (%s)"),
+					*Camera->GetName(), *Camera->GetClass()->GetName());
+			}
+		}
+	}
+}
+#endif // WITH_EDITOR

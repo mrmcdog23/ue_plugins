@@ -8,51 +8,28 @@
 
 class ACameraActor;
 class UArrowComponent;
+class ISequencer;
 
-
+/**
+ * Place this actor in the level. Whenever a Sequencer is opened, any spawned cameras
+ * in the focused sequence are parented under this actor, so moving/rotating the actor
+ * moves the whole camera animation.
+ */
 UCLASS()
 class TESTING_API AAnimOffsetActor : public AActor
 {
 	GENERATED_BODY()
-	
-public:	
-	// Sets default values for this actor's properties
+
+public:
 	AAnimOffsetActor();
 
-	/** Camera to offset. If empty, the first CameraActor found in the level is used. */
+	/** Optional level camera (not spawned by the sequence) to parent under this actor as well. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	TSoftObjectPtr<ACameraActor> TargetCamera;
 
-	/** Apply the offset automatically whenever a Level Sequence is opened. */
+	/** Parent spawned cameras under this actor whenever a Sequencer is opened. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	bool bMoveCameraOnSequenceOpen = true;
-
-	/** Also apply the actor's rotation offset (not just location). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
-	bool bApplyRotationOffset = true;
-
-	/** Actor transform that counts as "zero offset". Set automatically on placement. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor|State")
-	FTransform OriginTransform;
-
-	/** Camera transform that the offset is added to. Captured the first time it is applied. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor|State")
-	FTransform CameraBaseTransform;
-
-	UPROPERTY(VisibleAnywhere, Category = "Camera Anchor|State")
-	bool bHasCameraBase = false;
-
-	/** Apply the offset to the camera now. */
-	UFUNCTION(CallInEditor, Category = "Camera Anchor")
-	void ApplyOffsetNow();
-
-	/** Treat this actor's current transform as zero offset. */
-	UFUNCTION(CallInEditor, Category = "Camera Anchor")
-	void SetOriginToCurrent();
-
-	/** Treat the camera's current transform as its base (use after you reposition the camera yourself). */
-	UFUNCTION(CallInEditor, Category = "Camera Anchor")
-	void RecaptureCameraBase();
 
 protected:
 	UPROPERTY(VisibleAnywhere)
@@ -60,9 +37,6 @@ protected:
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UArrowComponent> Arrow;
-
-	ACameraActor* ResolveCamera() const;
-
 
 #if WITH_EDITOR
 	virtual void PostActorCreated() override;
@@ -72,9 +46,11 @@ protected:
 private:
 	void RegisterSequencerHook();
 	void UnregisterSequencerHook();
-	void OnSequencerCreated(TSharedRef<class ISequencer> InSequencer);
+	void OnSequencerCreated(TSharedRef<ISequencer> InSequencer);
+
+	/** Parents any spawned cameras (and TargetCamera, if set) under this actor. */
+	void AttachSpawnedCameras(ISequencer& InSequencer);
 
 	FDelegateHandle SequencerCreatedHandle;
 #endif
 };
-
