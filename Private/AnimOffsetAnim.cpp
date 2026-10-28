@@ -11,6 +11,7 @@
 #include "Containers/Ticker.h"
 #include "Curves/RealCurve.h"
 #include "Editor.h"
+#include "Engine/StaticMeshActor.h"
 #include "ISequencer.h"
 #include "ISequencerModule.h"
 #include "Misc/MessageDialog.h"
@@ -96,12 +97,14 @@ void AAnimOffsetAnim::PostActorCreated()
 {
 	Super::PostActorCreated();
 	RegisterSequencerHook();
+	StartChildWatcher();
 }
 
 void AAnimOffsetAnim::PostLoad()
 {
 	Super::PostLoad();
 	RegisterSequencerHook();
+	StartChildWatcher();
 }
 
 void AAnimOffsetAnim::BeginDestroy()
@@ -138,6 +141,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 				// Sequencer closed: forget per-session state so reopening starts clean.
 				Self->ParentedByBinding.Reset();
 				Self->OptedOutBindings.Reset();
+				Self->SequencerManaged.Reset();
 				return false;
 			}
 
@@ -179,7 +183,7 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 	};
 	TArray<FUnparented> JustUnparented;
 
-	for (const FMovieSceneBinding& Binding : MovieScene->GetBindings())
+	for (const FMovieSceneBinding& Binding : AsConst(*MovieScene).GetBindings()) // const overload: the non-const GetBindings() is deprecated
 	{
 		const FGuid BindingId = Binding.GetObjectGuid();
 
@@ -215,6 +219,7 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			if (CurrentParent == this)
 			{
 				// Covers cameras we attached and anything the artist parented by hand.
+				SequencerManaged.AddUnique(TWeakObjectPtr<AActor>(Actor));
 				// Keep refreshing the transform relative to us, so we know where it sat if it gets unparented.
 				FTrackedActor& Tracked = ParentedByBinding.FindOrAdd(BindingId);
 				Tracked.Actor = Actor;
@@ -234,7 +239,10 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 				// Only offer a fix-up if it is now free-floating. If they dragged it under some other actor, just respect that.
 				if (!CurrentParent)
 				{
-					JustUnparented.Add({ BindingId, Actor, LocalToAnchor });
+					FUnparented& Item = JustUnparented.AddDefaulted_GetRef();
+					Item.BindingId = BindingId;
+					Item.Actor = Actor;
+					Item.LocalToAnchor = LocalToAnchor;
 				}
 				continue;
 			}
@@ -264,6 +272,147 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			HandleActorUnparented(InSequencer, Item.BindingId, Actor, Item.LocalToAnchor);
 		}
 	}
+}
+
+
+void AAnimOffsetAnim::OfferKeepTransform(AActor* Actor, const FTransform& LocalToAnchor)
+{
+	const FText Message = FText::Format(
+		NSLOCTEXT("CameraAnchor", "KeepPrompt",
+			"'{0}' was unparented from '{1}' and has no transform animation.\n\n"
+			"Do you want to keep the transform it had under '{1}'?\n\n"
+			"Yes: moves it to where it was sitting while parented (world space, using '{1}' as it is now).\n"
+			"No: leaves it exactly where it is now."),
+		FText::FromString(Actor->GetActorLabel()),
+		FText::FromString(GetActorLabel()));
+	const FText Title = NSLOCTEXT("CameraAnchor", "KeepTitle", "Keep Transform?");
+
+	// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
+	if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
+	{
+		// Child-in-anchor-space * anchor-in-world = where it was sitting while parented.
+		const FTransform DesiredWorld = LocalToAnchor * GetActorTransform();
+
+		const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "KeepTransaction", "Keep Transform After Unparent"));
+		Actor->Modify();
+		Actor->SetActorTransform(DesiredWorld, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+}
+
+
+// The child watcher only handles static mesh actors. To cover every kind of actor, make this return true for any non-null actor.
+static bool IsWatchedChildType(const AActor* Actor)
+{
+	return Actor && Actor->IsA<AStaticMeshActor>();
+}
+
+
+void AAnimOffsetAnim::StartChildWatcher()
+{
+	if (HasAnyFlags(RF_ClassDefaultObject) || bChildWatcherStarted)
+	{
+		return;
+	}
+	bChildWatcherStarted = true;
+
+	TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis](float)
+		{
+			AAnimOffsetAnim* Self = WeakThis.Get();
+			return Self ? Self->TickChildWatcher() : false; // actor is gone: stop
+		}), 0.1f);
+}
+
+
+bool AAnimOffsetAnim::TickChildWatcher()
+{
+	if (IsRunningCommandlet())
+	{
+		return false;
+	}
+
+	UWorld* World = GetWorld();
+	if (!GEditor || !World)
+	{
+		return true; // not ready yet
+	}
+	if (World->IsGameWorld())
+	{
+		return false; // PIE copy of this actor: the editor-only watcher is not needed there
+	}
+	if (World != GEditor->GetEditorWorldContext().World() || bPromptOpen)
+	{
+		return true;
+	}
+
+	TArray<AActor*> ChildActors;
+	GetAttachedActors(ChildActors);
+
+	// Add new static meshes, and refresh where each one sits relative to us.
+	for (AActor* Child : ChildActors)
+	{
+		if (!IsWatchedChildType(Child))
+		{
+			continue;
+		}
+
+		const FTransform LocalToAnchor = Child->GetActorTransform().GetRelativeTransform(GetActorTransform());
+
+		FWatchedChild* Existing = WatchedChildren.FindByPredicate([Child](const FWatchedChild& Watched)
+			{
+				return Watched.Actor.Get() == Child;
+			});
+		if (Existing)
+		{
+			Existing->LocalToAnchor = LocalToAnchor;
+		}
+		else
+		{
+			FWatchedChild& Added = WatchedChildren.AddDefaulted_GetRef();
+			Added.Actor = Child;
+			Added.LocalToAnchor = LocalToAnchor;
+		}
+	}
+
+	// Anything we were watching that is no longer our child was unparented (or deleted).
+	TArray<TWeakObjectPtr<AActor>> LostActors;
+	TArray<FTransform> LostTransforms;
+
+	for (int32 Index = WatchedChildren.Num() - 1; Index >= 0; --Index)
+	{
+		AActor* Actor = WatchedChildren[Index].Actor.Get();
+		if (Actor && ChildActors.Contains(Actor))
+		{
+			continue; // still ours
+		}
+
+		// Only a real "unparent" if the actor still exists, is free-floating (not re-parented elsewhere),
+		// and the Sequencer path isn't already handling it.
+		if (IsValid(Actor) && !Actor->IsActorBeingDestroyed() && !Actor->GetAttachParentActor()
+			&& !SequencerManaged.Contains(TWeakObjectPtr<AActor>(Actor)))
+		{
+			LostActors.Add(Actor);
+			LostTransforms.Add(WatchedChildren[Index].LocalToAnchor);
+		}
+		WatchedChildren.RemoveAt(Index);
+	}
+
+	if (!bPromptToBakeOnUnparent || LostActors.Num() == 0)
+	{
+		return true;
+	}
+
+	bPromptOpen = true;
+	for (int32 Index = 0; Index < LostActors.Num(); ++Index)
+	{
+		if (AActor* Actor = LostActors[Index].Get())
+		{
+			OfferKeepTransform(Actor, LostTransforms[Index]);
+		}
+	}
+	bPromptOpen = false;
+
+	return true;
 }
 
 
@@ -326,25 +475,7 @@ void AAnimOffsetAnim::HandleActorUnparented(ISequencer& InSequencer, const FGuid
 	}
 	else
 	{
-		const FText Message = FText::Format(
-			NSLOCTEXT("CameraAnchor", "KeepPrompt",
-				"'{0}' was unparented from '{1}' and has no transform animation.\n\n"
-				"Do you want to keep the transform it had under '{1}'?\n\n"
-				"Yes: moves it to where it was sitting while parented (world space, using '{1}' as it is now).\n"
-				"No: leaves it exactly where it is now."),
-			FText::FromString(Actor->GetActorLabel()),
-			FText::FromString(GetActorLabel()));
-		const FText Title = NSLOCTEXT("CameraAnchor", "KeepTitle", "Keep Transform?");
-
-		if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
-		{
-			// Child-in-anchor-space * anchor-in-world = where it was sitting while parented.
-			const FTransform DesiredWorld = LocalToAnchor * GetActorTransform();
-
-			const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "KeepTransaction", "Keep Transform After Unparent"));
-			Actor->Modify();
-			Actor->SetActorTransform(DesiredWorld, false, nullptr, ETeleportType::TeleportPhysics);
-		}
+		OfferKeepTransform(Actor, LocalToAnchor);
 	}
 
 	bPromptOpen = false;

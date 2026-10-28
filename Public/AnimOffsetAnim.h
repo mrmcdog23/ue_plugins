@@ -34,6 +34,7 @@ public:
 	 * from this actor, offer to fix it up:
 	 * - animated actors: ask whether to bake the animation (as it looks under this actor) into world space.
 	 * - actors with no transform animation: ask whether to keep the transform it had under this actor.
+	 * Static mesh actors parented under this actor get the keep-transform prompt even when they are not in a Sequencer.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	bool bPromptToBakeOnUnparent = true;
@@ -85,6 +86,15 @@ private:
 	/** Rewrites the binding's transform track so that, once unparented, the actor moves exactly as it did under this actor. */
 	void BakeActorToWorld(ISequencer& InSequencer, const FGuid& BindingId);
 
+	/** Asks "keep the transform it had under this actor?" and, on Yes, moves the actor back to where it sat while parented. */
+	void OfferKeepTransform(AActor* Actor, const FTransform& LocalToAnchor);
+
+	/** Starts the Sequencer-independent poll that watches static meshes parented under this actor. */
+	void StartChildWatcher();
+
+	/** One poll of the child watcher. Returns false to stop ticking. */
+	bool TickChildWatcher();
+
 	FDelegateHandle SequencerCreatedHandle;
 
 	/** Actors this actor has parented / seen parented, per Sequencer binding. Used to tell "user unparented it" from "freshly respawned". */
@@ -94,5 +104,20 @@ private:
 	TSet<FGuid> OptedOutBindings;
 
 	bool bPromptOpen = false;
+
+	/** A static mesh currently parented under this actor, and where it sits relative to us (last observed). */
+	struct FWatchedChild
+	{
+		TWeakObjectPtr<AActor> Actor;
+		FTransform LocalToAnchor = FTransform::Identity;
+	};
+
+	bool bChildWatcherStarted = false;
+
+	/** Static meshes seen under this actor, whether or not they are in a Sequencer. */
+	TArray<FWatchedChild> WatchedChildren;
+
+	/** Actors the Sequencer path is already handling (bake / keep prompt), so the child watcher must not prompt for them too. */
+	TArray<TWeakObjectPtr<AActor>> SequencerManaged;
 #endif
 };
