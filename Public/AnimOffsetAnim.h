@@ -8,14 +8,15 @@
 
 class ACameraActor;
 class UArrowComponent;
+class UMovieScene;
 class ISequencer;
 
 UCLASS()
 class CONTROLCHAOS_API AAnimOffsetAnim : public AActor
 {
 	GENERATED_BODY()
-	
-public:	
+
+public:
 	virtual void Tick(float DeltaSeconds) override;
 	// Sets default values for this actor's properties
 	AAnimOffsetAnim();
@@ -24,9 +25,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	TSoftObjectPtr<ACameraActor> TargetCamera;
 
-	/** Parent spawned cameras under this actor whenever a Sequencer is opened. */
+	/** Parent cameras bound in the Sequencer under this actor whenever a Sequencer is opened (runtime: sequence-spawned cameras). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	bool bMoveCameraOnSequenceOpen = true;
+
+	/**
+	 * When the artist unparents an actor (camera, cube, anything bound in the open Sequencer, spawned or possessed)
+	 * from this actor, offer to fix it up:
+	 * - animated actors: ask whether to bake the animation (as it looks under this actor) into world space.
+	 * - actors with no transform animation: ask whether to keep the transform it had under this actor.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
+	bool bPromptToBakeOnUnparent = true;
 
 protected:
 	UPROPERTY(VisibleAnywhere)
@@ -39,18 +49,50 @@ protected:
 	void AttachRuntimeCameras();
 
 #if WITH_EDITOR
-virtual void PostActorCreated() override;
-virtual void PostLoad() override;
-virtual void BeginDestroy() override;
+	virtual void PostActorCreated() override;
+	virtual void PostLoad() override;
+	virtual void BeginDestroy() override;
 
 
 private:
+	/** An actor we have seen parented under this actor, per Sequencer binding. */
+	struct FTrackedActor
+	{
+		TWeakObjectPtr<AActor> Actor;
+
+		/** Last observed transform relative to this actor while it was parented. */
+		FTransform LocalToAnchor = FTransform::Identity;
+	};
+
 	void RegisterSequencerHook();
 	void UnregisterSequencerHook();
 	void OnSequencerCreated(TSharedRef<ISequencer> InSequencer);
 
-	/** Parents any spawned cameras (and TargetCamera, if set) under this actor. */
-	void AttachSpawnedCameras(ISequencer& InSequencer);
+	/**
+	 * Walks every actor bound in the focused sequence (spawnables and possessables alike).
+	 * - Cameras are parented under this actor automatically.
+	 * - Any bound actor the artist parented under this actor is remembered, and when it is later
+	 *   unparented the artist is offered a bake / keep-transform prompt.
+	 */
+	void TrackBoundActors(ISequencer& InSequencer);
+
+	/** True if the binding has a transform track with at least one key. */
+	bool IsBindingAnimated(UMovieScene* MovieScene, const FGuid& BindingId) const;
+
+	/** Shows the popup: "bake?" for animated actors, "keep transform?" for static ones. */
+	void HandleActorUnparented(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, const FTransform& LocalToAnchor);
+
+	/** Rewrites the binding's transform track so that, once unparented, the actor moves exactly as it did under this actor. */
+	void BakeActorToWorld(ISequencer& InSequencer, const FGuid& BindingId);
+
 	FDelegateHandle SequencerCreatedHandle;
+
+	/** Actors this actor has parented / seen parented, per Sequencer binding. Used to tell "user unparented it" from "freshly respawned". */
+	TMap<FGuid, FTrackedActor> ParentedByBinding;
+
+	/** Bindings the artist unparented: we must not re-attach these. */
+	TSet<FGuid> OptedOutBindings;
+
+	bool bPromptOpen = false;
 #endif
 };

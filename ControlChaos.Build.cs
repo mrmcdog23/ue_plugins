@@ -30,7 +30,8 @@ public class ControlChaos : ModuleRules
                 "InputCore",
                 "LevelSequence",
                 "MovieScene",
-                "Sequencer"
+                "Sequencer",
+                "MovieSceneTracks"
             });
 
 
