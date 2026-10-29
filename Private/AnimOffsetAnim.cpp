@@ -93,6 +93,70 @@ void AAnimOffsetAnim::AttachRuntimeCameras()
 
 
 #if WITH_EDITOR
+
+// ---------------------------------------------------------------------------------------------
+// Transform section helpers
+// Transform section channels: 0-2 location XYZ, 3-5 rotation (Roll, Pitch, Yaw), 6-8 scale XYZ.
+// ---------------------------------------------------------------------------------------------
+
+static UMovieScene3DTransformSection* FindTransformSection(UMovieScene* MovieScene, const FGuid& BindingId)
+{
+	UMovieScene3DTransformTrack* Track = MovieScene ? MovieScene->FindTrack<UMovieScene3DTransformTrack>(BindingId) : nullptr;
+	return (Track && Track->GetAllSections().Num() > 0)
+		? Cast<UMovieScene3DTransformSection>(Track->GetAllSections()[0])
+		: nullptr;
+}
+
+/** Every distinct time that has a key in any of the channels, sorted. */
+static void GatherKeyTimes(const TArrayView<FMovieSceneDoubleChannel*>& Channels, TArray<FFrameNumber>& OutTimes)
+{
+	TSet<FFrameNumber> Unique;
+	for (FMovieSceneDoubleChannel* Channel : Channels)
+	{
+		if (!Channel)
+		{
+			continue;
+		}
+		for (const FFrameNumber& Time : Channel->GetData().GetTimes())
+		{
+			Unique.Add(Time);
+		}
+	}
+	OutTimes = Unique.Array();
+	OutTimes.Sort();
+}
+
+/** The transform the channels currently describe at Time (whatever space the keys are in). */
+static FTransform ReadTransformAt(const TArrayView<FMovieSceneDoubleChannel*>& Channels, FFrameNumber Time)
+{
+	auto Eval = [&Channels, Time](int32 Index, double Default)
+		{
+			double Value = Default;
+			Channels[Index]->Evaluate(FFrameTime(Time), Value);
+			return Value;
+		};
+
+	return FTransform(
+		FRotator(Eval(4, 0.0), Eval(5, 0.0), Eval(3, 0.0)), // Pitch, Yaw, Roll
+		FVector(Eval(0, 0.0), Eval(1, 0.0), Eval(2, 0.0)),
+		FVector(Eval(6, 1.0), Eval(7, 1.0), Eval(8, 1.0)));
+}
+
+/** Sets the value of the key at Time, adding a key there if the channel has none. */
+static void SetKeyValueAt(FMovieSceneDoubleChannel* Channel, FFrameNumber Time, double Value)
+{
+	const int32 Index = Channel->GetData().FindKey(Time);
+	if (Index != INDEX_NONE)
+	{
+		Channel->GetData().GetValues()[Index].Value = Value;
+	}
+	else
+	{
+		Channel->GetData().AddKey(Time, FMovieSceneDoubleValue(Value));
+	}
+}
+
+
 void AAnimOffsetAnim::PostActorCreated()
 {
 	Super::PostActorCreated();
@@ -141,6 +205,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 				// Sequencer closed: forget per-session state so reopening starts clean.
 				Self->ParentedByBinding.Reset();
 				Self->OptedOutBindings.Reset();
+				Self->SeenUnparented.Reset();
 				Self->SequencerManaged.Reset();
 				return false;
 			}
@@ -183,6 +248,16 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 	};
 	TArray<FUnparented> JustUnparented;
 
+	// Animated bindings being parented for the first time: their keys must be converted to our space.
+	// Also handled after the loop, because the conversion scrubs the Sequencer.
+	struct FJustParented
+	{
+		FGuid BindingId;
+		TWeakObjectPtr<AActor> Actor;
+		bool bAttach = false; // true: we still have to attach it after converting (auto-parented camera)
+	};
+	TArray<FJustParented> JustParented;
+
 	for (const FMovieSceneBinding& Binding : AsConst(*MovieScene).GetBindings()) // const overload: the non-const GetBindings() is deprecated
 	{
 		const FGuid BindingId = Binding.GetObjectGuid();
@@ -218,6 +293,21 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			AActor* CurrentParent = Actor->GetAttachParentActor();
 			if (CurrentParent == this)
 			{
+				// The artist just parented an actor we had been seeing free-floating. Static actors keep their
+				// world transform on their own; animated ones have world-space keys that now read as offsets.
+				if (bKeepWorldOnFirstParent
+					&& !ParentedByBinding.Contains(BindingId)
+					&& SeenUnparented.Contains(BindingId)
+					&& !ConvertedBindings.Contains(BindingId)
+					&& IsBindingAnimated(MovieScene, BindingId))
+				{
+					FJustParented& Item = JustParented.AddDefaulted_GetRef();
+					Item.BindingId = BindingId;
+					Item.Actor = Actor;
+					Item.bAttach = false;
+				}
+				SeenUnparented.Remove(BindingId);
+
 				// Covers cameras we attached and anything the artist parented by hand.
 				SequencerManaged.AddUnique(TWeakObjectPtr<AActor>(Actor));
 				// Keep refreshing the transform relative to us, so we know where it sat if it gets unparented.
@@ -247,13 +337,37 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 				continue;
 			}
 
+			// Free-floating: remember it, so that if it shows up under us later we know it was parented just now.
+			if (!CurrentParent)
+			{
+				SeenUnparented.Add(BindingId);
+			}
+
 			// New or respawned actor that we have never seen under us.
 			// Only cameras are parented automatically; every other actor is only
 			// tracked once the artist parents it themselves (handled above).
 			if (bMoveCameraOnSequenceOpen && Actor->IsA<ACameraActor>())
 			{
 				Actor->Modify(); // a possessed camera is a level actor: this marks the level dirty
-				Actor->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
+
+				const bool bAnimated = IsBindingAnimated(MovieScene, BindingId);
+
+				// First time under us and animated: convert the keys first, then attach (done after the loop).
+				if (bKeepWorldOnFirstParent && bAnimated && !ConvertedBindings.Contains(BindingId))
+				{
+					FJustParented& Item = JustParented.AddDefaulted_GetRef();
+					Item.BindingId = BindingId;
+					Item.Actor = Actor;
+					Item.bAttach = true;
+					continue;
+				}
+
+				// Static: keep where it is. Animated and already converted (a respawn): its keys are already
+				// relative to us, so KeepRelative is correct. Setting off: previous behaviour.
+				const bool bKeepWorld = bKeepWorldOnFirstParent && !bAnimated;
+				Actor->AttachToActor(this, bKeepWorld
+					? FAttachmentTransformRules::KeepWorldTransform
+					: FAttachmentTransformRules::KeepRelativeTransform);
 
 				FTrackedActor& Tracked = ParentedByBinding.FindOrAdd(BindingId);
 				Tracked.Actor = Actor;
@@ -265,6 +379,14 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 		}
 	}
 
+	for (const FJustParented& Item : JustParented)
+	{
+		if (AActor* Actor = Item.Actor.Get())
+		{
+			ConvertKeysToAnchorSpace(InSequencer, Item.BindingId, Actor, Item.bAttach);
+		}
+	}
+
 	for (const FUnparented& Item : JustUnparented)
 	{
 		if (AActor* Actor = Item.Actor.Get())
@@ -272,6 +394,114 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			HandleActorUnparented(InSequencer, Item.BindingId, Actor, Item.LocalToAnchor);
 		}
 	}
+}
+
+
+void AAnimOffsetAnim::ConvertKeysToAnchorSpace(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, bool bAttach)
+{
+	auto AttachIfNeeded = [this, Actor, bAttach]()
+		{
+			if (bAttach && Actor && Actor->GetAttachParentActor() != this)
+			{
+				Actor->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
+			}
+		};
+
+	UMovieSceneSequence* Sequence = InSequencer.GetFocusedMovieSceneSequence();
+	UMovieScene* MovieScene = Sequence ? Sequence->GetMovieScene() : nullptr;
+	UMovieScene3DTransformSection* Section = FindTransformSection(MovieScene, BindingId);
+	if (!Section)
+	{
+		AttachIfNeeded();
+		return;
+	}
+
+	TArrayView<FMovieSceneDoubleChannel*> Channels = Section->GetChannelProxy().GetChannels<FMovieSceneDoubleChannel>();
+	if (Channels.Num() < 9)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: unexpected transform channel layout, key conversion skipped."));
+		AttachIfNeeded();
+		return;
+	}
+
+	TArray<FFrameNumber> KeyTimes;
+	GatherKeyTimes(Channels, KeyTimes);
+	if (KeyTimes.Num() == 0)
+	{
+		AttachIfNeeded();
+		return;
+	}
+
+	const FFrameTime OriginalTime = InSequencer.GetLocalTime().Time;
+
+	// 1) At each existing key: the keys still hold the world transform the artist authored,
+	//    and this actor may itself be animated, so scrub to get where we are at that time.
+	TArray<FTransform> NewRelative;
+	NewRelative.Reserve(KeyTimes.Num());
+
+	for (const FFrameNumber& Time : KeyTimes)
+	{
+		const FTransform World = ReadTransformAt(Channels, Time);
+
+		InSequencer.SetLocalTime(FFrameTime(Time));
+		InSequencer.ForceEvaluate();
+		const FTransform AnchorWorld = GetActorTransform();
+
+		NewRelative.Add(World.GetRelativeTransform(AnchorWorld));
+	}
+
+	// 2) Rewrite the values on the existing key times (one undo step). No extra keys are made per frame.
+	{
+		const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "ConvertTransaction", "Keep World Position On Parent"));
+		Section->Modify();
+		Modify();
+
+		double PreviousEuler[3] = { 0.0, 0.0, 0.0 };
+
+		for (int32 i = 0; i < KeyTimes.Num(); ++i)
+		{
+			const FTransform& Xform = NewRelative[i];
+			const FVector Loc = Xform.GetLocation();
+			const FRotator Rot = Xform.GetRotation().Rotator();
+			const FVector Scale = Xform.GetScale3D();
+
+			double Euler[3] = { Rot.Roll, Rot.Pitch, Rot.Yaw };
+			if (i > 0)
+			{
+				// Unwrap so a 359 -> 1 degree wrap doesn't become a full spin between keys.
+				for (int32 Axis = 0; Axis < 3; ++Axis)
+				{
+					Euler[Axis] = PreviousEuler[Axis] + FMath::UnwindDegrees(Euler[Axis] - PreviousEuler[Axis]);
+				}
+			}
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				PreviousEuler[Axis] = Euler[Axis];
+			}
+
+			const double Values[9] = { Loc.X, Loc.Y, Loc.Z, Euler[0], Euler[1], Euler[2], Scale.X, Scale.Y, Scale.Z };
+			for (int32 Channel = 0; Channel < 9; ++Channel)
+			{
+				SetKeyValueAt(Channels[Channel], KeyTimes[i], Values[Channel]);
+			}
+		}
+
+		for (int32 Channel = 0; Channel < 9; ++Channel)
+		{
+			Channels[Channel]->AutoSetTangents();
+		}
+
+		ConvertedBindings.Add(BindingId);
+	}
+
+	AttachIfNeeded();
+
+	InSequencer.SetLocalTime(OriginalTime);
+	InSequencer.NotifyMovieSceneDataChanged(EMovieSceneDataChangeType::TrackValueChanged);
+	InSequencer.ForceEvaluate();
+
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: kept world position for '%s' (%d keys converted)."),
+		*Actor->GetName(), KeyTimes.Num());
 }
 
 
@@ -461,7 +691,7 @@ void AAnimOffsetAnim::HandleActorUnparented(ISequencer& InSequencer, const FGuid
 			NSLOCTEXT("CameraAnchor", "BakePrompt",
 				"'{0}' was unparented from '{1}'.\n\n"
 				"Do you want to bake its animation as it looks under '{1}'?\n\n"
-				"Yes: re-keys it in world space every frame, so it keeps moving exactly as it did while parented.\n"
+				"Yes: re-keys it in world space on its existing keys, so it keeps moving as it did while parented.\n"
 				"No: leaves the existing keys untouched (it will jump)."),
 			FText::FromString(Actor->GetActorLabel()),
 			FText::FromString(GetActorLabel()));
@@ -479,6 +709,13 @@ void AAnimOffsetAnim::HandleActorUnparented(ISequencer& InSequencer, const FGuid
 	}
 
 	bPromptOpen = false;
+
+	// Its keys are no longer relative to us, so if it is parented again later they must be converted again.
+	if (ConvertedBindings.Contains(BindingId))
+	{
+		Modify();
+		ConvertedBindings.Remove(BindingId);
+	}
 
 	// A camera is no longer meant to live under this actor, so stop re-parenting cameras at runtime too.
 	// (After a bake / keep the transform is world space, so re-parenting in PIE/MRQ would apply the offset twice.)
@@ -500,10 +737,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 		return;
 	}
 
-	UMovieScene3DTransformTrack* Track = MovieScene->FindTrack<UMovieScene3DTransformTrack>(BindingId);
-	UMovieScene3DTransformSection* Section = (Track && Track->GetAllSections().Num() > 0)
-		? Cast<UMovieScene3DTransformSection>(Track->GetAllSections()[0])
-		: nullptr;
+	UMovieScene3DTransformSection* Section = FindTransformSection(MovieScene, BindingId);
 	if (!Section)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: no transform track to bake."));
@@ -516,6 +750,28 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: unexpected transform channel layout, bake aborted."));
 		return;
+	}
+
+	// Only the times that already have a key are baked, not every frame.
+	TArray<FFrameNumber> KeyTimes;
+	GatherKeyTimes(Channels, KeyTimes);
+	if (KeyTimes.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: no keys to bake."));
+		return;
+	}
+
+	// Remember each original key so its interpolation mode survives the rewrite.
+	TArray<TMap<FFrameNumber, FMovieSceneDoubleValue>> OriginalKeys;
+	OriginalKeys.SetNum(9);
+	for (int32 Channel = 0; Channel < 9; ++Channel)
+	{
+		TArrayView<const FFrameNumber> Times = Channels[Channel]->GetData().GetTimes();
+		TArrayView<FMovieSceneDoubleValue> Values = Channels[Channel]->GetData().GetValues();
+		for (int32 i = 0; i < Times.Num(); ++i)
+		{
+			OriginalKeys[Channel].Add(Times[i], Values[i]);
+		}
 	}
 
 	// Finds the live actor for this binding and makes sure it is under this actor,
@@ -536,30 +792,23 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 			return nullptr;
 		};
 
-	const FFrameRate TickRes = MovieScene->GetTickResolution();
-	const FFrameRate DisplayRate = MovieScene->GetDisplayRate();
-	const TRange<FFrameNumber> Range = MovieScene->GetPlaybackRange();
-	const int32 StartFrame = FFrameRate::TransformTime(FFrameTime(Range.GetLowerBoundValue()), TickRes, DisplayRate).CeilToFrame().Value;
-	const int32 EndFrame = FFrameRate::TransformTime(FFrameTime(Range.GetUpperBoundValue()), TickRes, DisplayRate).FloorToFrame().Value;
-
 	const FFrameTime OriginalTime = InSequencer.GetLocalTime().Time;
 
-	// Re-parent before sampling so the very first evaluated frame is already applied relative to us.
+	// Re-parent before sampling so the very first evaluated key is already applied relative to us.
 	GetAttachedActor();
 
-	// 1) Sample: scrub every frame with the actor parented, record its WORLD transform.
+	// 1) Sample: scrub to each existing key time with the actor parented, record its WORLD transform.
 	TArray<FFrameNumber> SampleTimes;
 	TArray<FTransform> SampleTransforms;
 
-	for (int32 Frame = StartFrame; Frame <= EndFrame; ++Frame)
+	for (const FFrameNumber& Time : KeyTimes)
 	{
-		const FFrameTime Time = FFrameRate::TransformTime(FFrameTime(FFrameNumber(Frame)), DisplayRate, TickRes);
-		InSequencer.SetLocalTime(Time);
+		InSequencer.SetLocalTime(FFrameTime(Time));
 		InSequencer.ForceEvaluate();
 
 		if (AActor* Actor = GetAttachedActor())
 		{
-			SampleTimes.Add(Time.RoundToFrame());
+			SampleTimes.Add(Time);
 			SampleTransforms.Add(Actor->GetActorTransform());
 		}
 	}
@@ -577,7 +826,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 		return;
 	}
 
-	// 3) Replace the keys with the sampled world-space values (one undo step).
+	// 3) Replace the keys with the sampled world-space values, on the original key times only (one undo step).
 	{
 		const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "BakeTransaction", "Bake Animation To World"));
 		Section->Modify();
@@ -613,17 +862,25 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 			const double Values[9] = { Loc.X, Loc.Y, Loc.Z, Euler[0], Euler[1], Euler[2], Scale.X, Scale.Y, Scale.Z };
 			for (int32 Channel = 0; Channel < 9; ++Channel)
 			{
-				FMovieSceneDoubleValue Key(Values[Channel]);
-				Key.InterpMode = RCIM_Linear; // a key on every frame, so linear reproduces the sampled motion
+				FMovieSceneDoubleValue Key(Values[Channel]); // cubic, auto tangents by default
+				if (const FMovieSceneDoubleValue* Original = OriginalKeys[Channel].Find(SampleTimes[i]))
+				{
+					Key.InterpMode = Original->InterpMode; // keep linear / constant keys as they were
+				}
 				Channels[Channel]->GetData().AddKey(SampleTimes[i], Key);
 			}
+		}
+
+		for (int32 Channel = 0; Channel < 9; ++Channel)
+		{
+			Channels[Channel]->AutoSetTangents();
 		}
 	}
 
 	InSequencer.SetLocalTime(OriginalTime);
 	InSequencer.NotifyMovieSceneDataChanged(EMovieSceneDataChangeType::TrackValueChanged);
 
-	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baked %d frames to world space."), SampleTimes.Num());
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baked %d keys to world space."), SampleTimes.Num());
 }
 
 

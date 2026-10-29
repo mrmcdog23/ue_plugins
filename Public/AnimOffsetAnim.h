@@ -30,9 +30,18 @@ public:
 	bool bMoveCameraOnSequenceOpen = true;
 
 	/**
+	 * When an actor is parented under this actor for the first time, keep it where it is in the world instead of offsetting it.
+	 * - static actors: attached keeping their world transform.
+	 * - animated actors: their existing keys are re-expressed relative to this actor (at the existing key times only),
+	 *   so the animation plays back in the same world position as before.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
+	bool bKeepWorldOnFirstParent = true;
+
+	/**
 	 * When the artist unparents an actor (camera, cube, anything bound in the open Sequencer, spawned or possessed)
 	 * from this actor, offer to fix it up:
-	 * - animated actors: ask whether to bake the animation (as it looks under this actor) into world space.
+	 * - animated actors: ask whether to bake the animation (as it looks under this actor) into world space. Only the existing key times are keyed.
 	 * - actors with no transform animation: ask whether to keep the transform it had under this actor.
 	 * Static mesh actors parented under this actor get the keep-transform prompt even when they are not in a Sequencer.
 	 */
@@ -45,6 +54,13 @@ protected:
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UArrowComponent> Arrow;
+
+	/**
+	 * Sequencer bindings whose keys have already been converted to this actor's space.
+	 * Saved with the level so a respawned camera is not converted a second time.
+	 */
+	UPROPERTY()
+	TSet<FGuid> ConvertedBindings;
 
 	/** Runtime (PIE / MRQ / game): parent sequence-spawned cameras under this actor. */
 	void AttachRuntimeCameras();
@@ -80,10 +96,17 @@ private:
 	/** True if the binding has a transform track with at least one key. */
 	bool IsBindingAnimated(UMovieScene* MovieScene, const FGuid& BindingId) const;
 
+	/**
+	 * First parent of an animated actor: its keys currently hold world-space values.
+	 * Re-expresses them relative to this actor at each existing key time (so nothing moves),
+	 * then optionally attaches the actor.
+	 */
+	void ConvertKeysToAnchorSpace(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, bool bAttach);
+
 	/** Shows the popup: "bake?" for animated actors, "keep transform?" for static ones. */
 	void HandleActorUnparented(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, const FTransform& LocalToAnchor);
 
-	/** Rewrites the binding's transform track so that, once unparented, the actor moves exactly as it did under this actor. */
+	/** Rewrites the binding's transform keys (at the existing key times only) so that, once unparented, the actor moves as it did under this actor. */
 	void BakeActorToWorld(ISequencer& InSequencer, const FGuid& BindingId);
 
 	/** Asks "keep the transform it had under this actor?" and, on Yes, moves the actor back to where it sat while parented. */
@@ -102,6 +125,9 @@ private:
 
 	/** Bindings the artist unparented: we must not re-attach these. */
 	TSet<FGuid> OptedOutBindings;
+
+	/** Bindings seen free-floating this session. If one later appears under us, the artist just parented it. */
+	TSet<FGuid> SeenUnparented;
 
 	bool bPromptOpen = false;
 
