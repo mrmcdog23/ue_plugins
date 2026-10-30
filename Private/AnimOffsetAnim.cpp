@@ -185,6 +185,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 	{
 		return;
 	}
+	/*
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sequencer opened, watching bound actors."));
 	ActiveSequencer = InSequencer;
 
@@ -214,6 +215,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 			Self->TrackBoundActors(*Sequencer);
 			return true; // keep running
 		}), 0.1f);
+		*/
 }
 
 
