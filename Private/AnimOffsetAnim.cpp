@@ -186,6 +186,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 		return;
 	}
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sequencer opened, watching bound actors."));
+	ActiveSequencer = InSequencer;
 
 	TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
 	TWeakPtr<ISequencer> WeakSequencer = InSequencer;
@@ -256,12 +257,6 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 	{
 		const FGuid BindingId = Binding.GetObjectGuid();
 
-		// The artist already took this actor out from under us: leave it alone.
-		if (OptedOutBindings.Contains(BindingId))
-		{
-			continue;
-		}
-
 		// FindBoundObjects resolves both spawnables and possessables (placed level actors).
 		for (TWeakObjectPtr<> Object : InSequencer.FindBoundObjects(BindingId, InSequencer.GetFocusedTemplateID()))
 		{
@@ -285,6 +280,25 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			}
 
 			AActor* CurrentParent = Actor->GetAttachParentActor();
+
+			if (OptedOutBindings.Contains(BindingId))
+			{
+				if (CurrentParent != this)
+				{
+					// The artist took this actor out from under us: leave it alone (and never auto-parent it again).
+					if (!CurrentParent)
+					{
+						SeenUnparented.Add(BindingId);
+					}
+					continue;
+				}
+
+				// The artist has parented it under us again: track it again, and treat it as a first parent
+				// so its (world space) keys are converted, otherwise it would offset and never be baked on the next unparent.
+				OptedOutBindings.Remove(BindingId);
+				SeenUnparented.Add(BindingId);
+			}
+
 			if (CurrentParent == this)
 			{
 				// The artist just parented an actor we had been seeing free-floating. Static actors keep their
@@ -631,9 +645,17 @@ bool AAnimOffsetAnim::TickChildWatcher()
 		Item.LocalToAnchor = LostTransforms[Index];
 	}
 
-	bPromptOpen = true;
-	OfferKeepTransforms(LostItems); // one prompt for everything unparented in this poll
-	bPromptOpen = false;
+	// If a Sequencer is open, let it decide per actor: animated ones are baked, static ones get "keep transform".
+	if (TSharedPtr<ISequencer> Sequencer = ActiveSequencer.Pin())
+	{
+		HandleActorsUnparented(*Sequencer, LostItems);
+	}
+	else
+	{
+		bPromptOpen = true;
+		OfferKeepTransforms(LostItems); // one prompt for everything unparented in this poll
+		bPromptOpen = false;
+	}
 
 	return true;
 }
@@ -662,6 +684,39 @@ bool AAnimOffsetAnim::IsBindingAnimated(UMovieScene* MovieScene, const FGuid& Bi
 		}
 	}
 	return false;
+}
+
+
+FGuid AAnimOffsetAnim::ResolveAnimatedBinding(ISequencer& InSequencer, UMovieScene* MovieScene, AActor* Actor, const FGuid& PreferredBinding) const
+{
+	if (!MovieScene || !Actor)
+	{
+		return FGuid();
+	}
+	if (PreferredBinding.IsValid() && IsBindingAnimated(MovieScene, PreferredBinding))
+	{
+		return PreferredBinding;
+	}
+
+	// The animation may live on the actor's root component binding, or the actor may be bound under another GUID.
+	const UObject* ActorRoot = Actor->GetRootComponent();
+	for (const FMovieSceneBinding& Binding : AsConst(*MovieScene).GetBindings())
+	{
+		const FGuid Id = Binding.GetObjectGuid();
+		if (!IsBindingAnimated(MovieScene, Id))
+		{
+			continue;
+		}
+		for (TWeakObjectPtr<> Object : InSequencer.FindBoundObjects(Id, InSequencer.GetFocusedTemplateID()))
+		{
+			const UObject* Bound = Object.Get();
+			if (Bound && (Bound == Actor || Bound == ActorRoot))
+			{
+				return Id;
+			}
+		}
+	}
+	return FGuid();
 }
 
 
@@ -710,6 +765,8 @@ void AAnimOffsetAnim::OfferKeepTransforms(const TArray<FUnparentedItem>& Items)
 
 void AAnimOffsetAnim::HandleActorsUnparented(ISequencer& InSequencer, const TArray<FUnparentedItem>& Items)
 {
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: %d actor(s) unparented."), Items.Num());
+
 	if (!bPromptToBakeOnUnparent || Items.Num() == 0)
 	{
 		return;
@@ -733,9 +790,10 @@ void AAnimOffsetAnim::HandleActorsUnparented(ISequencer& InSequencer, const TArr
 		}
 		bAnyCamera |= Actor->IsA<ACameraActor>();
 
-		if (IsBindingAnimated(MovieScene, Item.BindingId))
+		const FGuid AnimatedBinding = ResolveAnimatedBinding(InSequencer, MovieScene, Actor, Item.BindingId);
+		if (AnimatedBinding.IsValid())
 		{
-			Animated.Add(Item);
+			Animated.Add_GetRef(Item).BindingId = AnimatedBinding;
 			AnimatedNames += (AnimatedNames.IsEmpty() ? TEXT("") : TEXT(", ")) + FString::Printf(TEXT("'%s'"), *Actor->GetActorLabel());
 		}
 		else
@@ -844,50 +902,26 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 		}
 	}
 
-	// Finds the live actor for this binding and makes sure it is under this actor,
-	// so Sequencer's keyed values are applied relative to us while we sample.
-	auto GetAttachedActor = [this, &InSequencer, &BindingId]() -> AActor*
-		{
-			for (TWeakObjectPtr<> Object : InSequencer.FindBoundObjects(BindingId, InSequencer.GetFocusedTemplateID()))
-			{
-				if (AActor* Actor = Cast<AActor>(Object.Get()))
-				{
-					if (Actor != this && Actor->GetAttachParentActor() != this)
-					{
-						Actor->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
-					}
-					return Actor;
-				}
-			}
-			return nullptr;
-		};
-
 	const FFrameTime OriginalTime = InSequencer.GetLocalTime().Time;
 
-	// Re-parent before sampling so the very first evaluated key is already applied relative to us.
-	GetAttachedActor();
-
-	// 1) Sample: scrub to each existing key time with the actor parented, record its WORLD transform.
+	// 1) At each existing key the channels hold the transform relative to this actor, so read it straight from the
+	//    keys (no re-attaching and no relying on the actor having been evaluated), and scrub only to learn where
+	//    this actor itself is at that time. World = key (relative to us) * our world transform.
 	TArray<FFrameNumber> SampleTimes;
 	TArray<FTransform> SampleTransforms;
 
 	for (const FFrameNumber& Time : KeyTimes)
 	{
+		const FTransform LocalToAnchor = ReadTransformAt(Channels, Time);
+
 		InSequencer.SetLocalTime(FFrameTime(Time));
 		InSequencer.ForceEvaluate();
 
-		if (AActor* Actor = GetAttachedActor())
-		{
-			SampleTimes.Add(Time);
-			SampleTransforms.Add(Actor->GetActorTransform());
-		}
+		SampleTimes.Add(Time);
+		SampleTransforms.Add(LocalToAnchor * GetActorTransform());
 	}
 
-	// 2) Unparent, keeping the world position.
-	if (AActor* Actor = GetAttachedActor())
-	{
-		Actor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-	}
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baking %d keys."), SampleTimes.Num());
 
 	if (SampleTimes.Num() == 0)
 	{
@@ -950,6 +984,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 	// No NotifyMovieSceneDataChanged here: the caller does it once after all actors are baked,
 	// because it can respawn spawnables and would invalidate the ones still waiting their turn.
 	InSequencer.SetLocalTime(OriginalTime);
+	InSequencer.ForceEvaluate(); // the new world keys now drive the (unparented) actor
 
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baked %d keys to world space."), SampleTimes.Num());
 }

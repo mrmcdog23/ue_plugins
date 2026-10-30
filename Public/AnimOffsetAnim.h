@@ -97,6 +97,15 @@ private:
 	bool IsBindingAnimated(UMovieScene* MovieScene, const FGuid& BindingId) const;
 
 	/**
+	 * The binding that actually carries this actor's transform animation: the given binding if it is keyed,
+	 * otherwise any keyed binding of the actor or its root component. Invalid GUID if the actor is not animated.
+	 */
+	FGuid ResolveAnimatedBinding(ISequencer& InSequencer, UMovieScene* MovieScene, AActor* Actor, const FGuid& PreferredBinding) const;
+
+	/** The Sequencer we are watching, so the child watcher can bake animated actors instead of only offering "keep transform". */
+	TWeakPtr<ISequencer> ActiveSequencer;
+
+	/**
 	 * First parent of an animated actor: its keys currently hold world-space values.
 	 * Re-expresses them relative to this actor at each existing key time (so nothing moves),
 	 * then optionally attaches the actor.
