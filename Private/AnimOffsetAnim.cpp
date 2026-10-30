@@ -240,13 +240,7 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 
 	// Bindings whose actor the artist just unparented. Handled after the loop,
 	// because the popup / bake scrubs the Sequencer and must not run mid-iteration.
-	struct FUnparented
-	{
-		FGuid BindingId;
-		TWeakObjectPtr<AActor> Actor;
-		FTransform LocalToAnchor;
-	};
-	TArray<FUnparented> JustUnparented;
+	TArray<FUnparentedItem> JustUnparented;
 
 	// Animated bindings being parented for the first time: their keys must be converted to our space.
 	// Also handled after the loop, because the conversion scrubs the Sequencer.
@@ -329,7 +323,7 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 				// Only offer a fix-up if it is now free-floating. If they dragged it under some other actor, just respect that.
 				if (!CurrentParent)
 				{
-					FUnparented& Item = JustUnparented.AddDefaulted_GetRef();
+					FUnparentedItem& Item = JustUnparented.AddDefaulted_GetRef();
 					Item.BindingId = BindingId;
 					Item.Actor = Actor;
 					Item.LocalToAnchor = LocalToAnchor;
@@ -387,12 +381,9 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 		}
 	}
 
-	for (const FUnparented& Item : JustUnparented)
+	if (JustUnparented.Num() > 0)
 	{
-		if (AActor* Actor = Item.Actor.Get())
-		{
-			HandleActorUnparented(InSequencer, Item.BindingId, Actor, Item.LocalToAnchor);
-		}
+		HandleActorsUnparented(InSequencer, JustUnparented);
 	}
 }
 
@@ -632,14 +623,16 @@ bool AAnimOffsetAnim::TickChildWatcher()
 		return true;
 	}
 
-	bPromptOpen = true;
+	TArray<FUnparentedItem> LostItems;
 	for (int32 Index = 0; Index < LostActors.Num(); ++Index)
 	{
-		if (AActor* Actor = LostActors[Index].Get())
-		{
-			OfferKeepTransform(Actor, LostTransforms[Index]);
-		}
+		FUnparentedItem& Item = LostItems.AddDefaulted_GetRef();
+		Item.Actor = LostActors[Index];
+		Item.LocalToAnchor = LostTransforms[Index];
 	}
+
+	bPromptOpen = true;
+	OfferKeepTransforms(LostItems); // one prompt for everything unparented in this poll
 	bPromptOpen = false;
 
 	return true;
@@ -672,55 +665,132 @@ bool AAnimOffsetAnim::IsBindingAnimated(UMovieScene* MovieScene, const FGuid& Bi
 }
 
 
-void AAnimOffsetAnim::HandleActorUnparented(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, const FTransform& LocalToAnchor)
+void AAnimOffsetAnim::OfferKeepTransforms(const TArray<FUnparentedItem>& Items)
 {
-	if (!bPromptToBakeOnUnparent || !Actor)
+	TArray<const FUnparentedItem*> Valid;
+	FString Names;
+	for (const FUnparentedItem& Item : Items)
+	{
+		if (AActor* Actor = Item.Actor.Get())
+		{
+			Valid.Add(&Item);
+			Names += (Names.IsEmpty() ? TEXT("") : TEXT(", ")) + FString::Printf(TEXT("'%s'"), *Actor->GetActorLabel());
+		}
+	}
+	if (Valid.Num() == 0)
+	{
+		return;
+	}
+
+	const FText Message = FText::Format(
+		NSLOCTEXT("CameraAnchor", "KeepPromptMulti",
+			"{0} unparented from '{1}' and have no transform animation.\n\n"
+			"Do you want to keep the transform they had under '{1}'?\n\n"
+			"Yes: moves each one to where it was sitting while parented (world space, using '{1}' as it is now).\n"
+			"No: leaves them exactly where they are now."),
+		FText::FromString(Names),
+		FText::FromString(GetActorLabel()));
+	const FText Title = NSLOCTEXT("CameraAnchor", "KeepTitleMulti", "Keep Transform?");
+
+	// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
+	if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
+	{
+		const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "KeepTransactionMulti", "Keep Transform After Unparent"));
+		for (const FUnparentedItem* Item : Valid)
+		{
+			if (AActor* Actor = Item->Actor.Get())
+			{
+				Actor->Modify();
+				Actor->SetActorTransform(Item->LocalToAnchor * GetActorTransform(), false, nullptr, ETeleportType::TeleportPhysics);
+			}
+		}
+	}
+}
+
+
+void AAnimOffsetAnim::HandleActorsUnparented(ISequencer& InSequencer, const TArray<FUnparentedItem>& Items)
+{
+	if (!bPromptToBakeOnUnparent || Items.Num() == 0)
 	{
 		return;
 	}
 
 	UMovieSceneSequence* Sequence = InSequencer.GetFocusedMovieSceneSequence();
 	UMovieScene* MovieScene = Sequence ? Sequence->GetMovieScene() : nullptr;
-	const bool bAnimated = IsBindingAnimated(MovieScene, BindingId);
+
+	// Split up front, while every actor pointer is still valid.
+	TArray<FUnparentedItem> Animated;
+	TArray<FUnparentedItem> Static;
+	FString AnimatedNames;
+	bool bAnyCamera = false;
+
+	for (const FUnparentedItem& Item : Items)
+	{
+		AActor* Actor = Item.Actor.Get();
+		if (!Actor)
+		{
+			continue;
+		}
+		bAnyCamera |= Actor->IsA<ACameraActor>();
+
+		if (IsBindingAnimated(MovieScene, Item.BindingId))
+		{
+			Animated.Add(Item);
+			AnimatedNames += (AnimatedNames.IsEmpty() ? TEXT("") : TEXT(", ")) + FString::Printf(TEXT("'%s'"), *Actor->GetActorLabel());
+		}
+		else
+		{
+			Static.Add(Item);
+		}
+	}
 
 	bPromptOpen = true;
 
-	if (bAnimated)
+	if (Animated.Num() > 0)
 	{
 		const FText Message = FText::Format(
-			NSLOCTEXT("CameraAnchor", "BakePrompt",
-				"'{0}' was unparented from '{1}'.\n\n"
-				"Do you want to bake its animation as it looks under '{1}'?\n\n"
-				"Yes: re-keys it in world space on its existing keys, so it keeps moving as it did while parented.\n"
-				"No: leaves the existing keys untouched (it will jump)."),
-			FText::FromString(Actor->GetActorLabel()),
+			NSLOCTEXT("CameraAnchor", "BakePromptMulti",
+				"{0} unparented from '{1}'.\n\n"
+				"Do you want to bake their animation as it looks under '{1}'?\n\n"
+				"Yes: re-keys each one in world space on its existing keys, so it keeps moving as it did while parented.\n"
+				"No: leaves the existing keys untouched (they will jump)."),
+			FText::FromString(AnimatedNames),
 			FText::FromString(GetActorLabel()));
-		const FText Title = NSLOCTEXT("CameraAnchor", "BakeTitle", "Bake Animation?");
+		const FText Title = NSLOCTEXT("CameraAnchor", "BakeTitleMulti", "Bake Animation?");
 
 		// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
 		if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
 		{
-			BakeActorToWorld(InSequencer, BindingId);
+			// Each bake finds its actor again through the binding, so one respawning cannot skip the rest.
+			for (const FUnparentedItem& Item : Animated)
+			{
+				BakeActorToWorld(InSequencer, Item.BindingId);
+			}
+			InSequencer.NotifyMovieSceneDataChanged(EMovieSceneDataChangeType::TrackValueChanged);
 		}
 	}
-	else
+
+	if (Static.Num() > 0)
 	{
-		OfferKeepTransform(Actor, LocalToAnchor);
+		OfferKeepTransforms(Static);
 	}
 
 	bPromptOpen = false;
 
-	// Its keys are no longer relative to us, so if it is parented again later they must be converted again.
-	if (ConvertedBindings.Contains(BindingId))
+	// Their keys are no longer relative to us, so if they are parented again later they must be converted again.
+	for (const FUnparentedItem& Item : Items)
 	{
-		Modify();
-		ConvertedBindings.Remove(BindingId);
+		if (ConvertedBindings.Contains(Item.BindingId))
+		{
+			Modify();
+			ConvertedBindings.Remove(Item.BindingId);
+		}
 	}
 
 	// A camera is no longer meant to live under this actor, so stop re-parenting cameras at runtime too.
 	// (After a bake / keep the transform is world space, so re-parenting in PIE/MRQ would apply the offset twice.)
 	// Other actors are never auto-parented at runtime, so there is nothing to switch off for them.
-	if (Actor->IsA<ACameraActor>())
+	if (bAnyCamera)
 	{
 		Modify();
 		bMoveCameraOnSequenceOpen = false;
@@ -877,8 +947,9 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 		}
 	}
 
+	// No NotifyMovieSceneDataChanged here: the caller does it once after all actors are baked,
+	// because it can respawn spawnables and would invalidate the ones still waiting their turn.
 	InSequencer.SetLocalTime(OriginalTime);
-	InSequencer.NotifyMovieSceneDataChanged(EMovieSceneDataChangeType::TrackValueChanged);
 
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baked %d keys to world space."), SampleTimes.Num());
 }

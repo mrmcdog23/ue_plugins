@@ -103,8 +103,22 @@ private:
 	 */
 	void ConvertKeysToAnchorSpace(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, bool bAttach);
 
-	/** Shows the popup: "bake?" for animated actors, "keep transform?" for static ones. */
-	void HandleActorUnparented(ISequencer& InSequencer, const FGuid& BindingId, AActor* Actor, const FTransform& LocalToAnchor);
+	/** An actor the artist just unparented from this actor, and where it sat relative to us. */
+	struct FUnparentedItem
+	{
+		FGuid BindingId;
+		TWeakObjectPtr<AActor> Actor;
+		FTransform LocalToAnchor = FTransform::Identity;
+	};
+
+	/**
+	 * Everything unparented in the same poll is handled together: one "bake?" prompt covering all animated actors
+	 * (each is baked on its existing keys) and one "keep transform?" prompt covering all static ones.
+	 */
+	void HandleActorsUnparented(ISequencer& InSequencer, const TArray<FUnparentedItem>& Items);
+
+	/** One "keep the transform they had under this actor?" prompt for several static actors. */
+	void OfferKeepTransforms(const TArray<FUnparentedItem>& Items);
 
 	/** Rewrites the binding's transform keys (at the existing key times only) so that, once unparented, the actor moves as it did under this actor. */
 	void BakeActorToWorld(ISequencer& InSequencer, const FGuid& BindingId);
