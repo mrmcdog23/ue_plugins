@@ -15,6 +15,7 @@
 #include "Engine/StaticMeshActor.h"
 #include "ISequencer.h"
 #include "ISequencerModule.h"
+#include "LevelEditorSequencerIntegration.h" // module "Sequencer"
 #include "Misc/MessageDialog.h"
 #include "Modules/ModuleManager.h"
 #include "MovieScene.h"
@@ -174,21 +175,25 @@ void AAnimOffsetAnim::PostLoad()
 
 void AAnimOffsetAnim::BeginDestroy()
 {
-	//UnregisterSequencerHook();
+	UnregisterSequencerHook();
 	Super::BeginDestroy();
 }
 
 void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 {
-	// Note: not gated on bMoveCameraOnSequenceOpen. That flag only controls camera auto-parenting
-	// (checked live in TrackBoundActors), so tracking of other actors keeps working when it is off.
+	// Note: not gated on any flag. Tracking of bound actors (parent / unparent detection) always runs.
 	if (!GEditor || GetWorld() != GEditor->GetEditorWorldContext().World())
 	{
 		return;
 	}
 
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sequencer opened, watching bound actors."));
+	StartSequencerPoll(InSequencer);
+}
 
+
+void AAnimOffsetAnim::StartSequencerPoll(TSharedRef<ISequencer> InSequencer)
+{
 	// Already watching this exact Sequencer: don't start a second poll.
 	if (ActiveSequencer.Pin() == InSequencer.ToSharedPtr())
 	{
@@ -202,8 +207,7 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 	TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
 	TWeakPtr<ISequencer> WeakSequencer = InSequencer;
 
-	// Poll while this Sequencer is open, so cameras that get respawned are re-parented
-	// and actors the artist parents/unparents are noticed.
+	// Poll while this Sequencer is open, so actors the artist parents/unparents are noticed.
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis, WeakSequencer](float)
 		{
 			AAnimOffsetAnim* Self = WeakThis.Get();
@@ -228,6 +232,29 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 }
 
 
+void AAnimOffsetAnim::TryAdoptOpenSequencer()
+{
+	if (ActiveSequencer.IsValid())
+	{
+		return;
+	}
+
+	// RegisterOnSequencerCreated only fires for Sequencers created AFTER we registered. If the level sequence
+	// was already open (actor placed / level loaded / Live Coding reload while it was open) we never heard about it,
+	// so look for it explicitly.
+	// NOTE: check that GetSequencers() exists in your engine version (see LevelEditorSequencerIntegration.h).
+	for (const TWeakPtr<ISequencer>& Weak : FLevelEditorSequencerIntegration::Get().GetSequencers())
+	{
+		if (TSharedPtr<ISequencer> Seq = Weak.Pin())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: found an already-open sequencer, watching bound actors."));
+			StartSequencerPoll(Seq.ToSharedRef());
+			break;
+		}
+	}
+}
+
+
 void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 {
 	// A bake/prompt is in progress (the modal dialog pumps the ticker), don't re-enter.
@@ -236,8 +263,8 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 		return;
 	}
 
-	// Nothing to do if both features are off.
-	if (!bMoveCameraOnSequenceOpen && !bPromptToBakeOnUnparent)
+	// Nothing to do if the prompts are off.
+	if (!bPromptToBakeOnUnparent)
 	{
 		return;
 	}
@@ -340,17 +367,6 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			// the artist unparented it. (A respawned spawnable is a different object, so it falls through.)
 			const FTrackedActor* Previous = ParentedByBinding.Find(BindingId);
 
-			// DEBUG: remove once the camera unparent issue is diagnosed.
-			if (Actor->IsA<ACameraActor>())
-			{
-				UE_LOG(LogTemp, Warning, TEXT("CameraAnchor[cam]: %s parent=%s hasPrev=%d samePtr=%d optedOut=%d"),
-					*Actor->GetName(),
-					CurrentParent ? *CurrentParent->GetName() : TEXT("none"),
-					Previous != nullptr,
-					Previous && Previous->Actor.Get() == Actor,
-					OptedOutBindings.Contains(BindingId));
-			}
-
 			if (Previous && Previous->Actor.Get() == Actor)
 			{
 				const FTransform LocalToAnchor = Previous->LocalToAnchor; // copy before Remove()
@@ -368,45 +384,31 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 				continue;
 			}
 
+			// A spawnable camera we had seen under us was respawned by Sequencer (spawnables come back unparented).
+			// Put it back where the artist had it. Cameras the artist never parented are never touched.
+			const bool bRespawnedTracked = Previous
+				&& Previous->Actor.Get() != Actor
+				&& !CurrentParent
+				&& Actor->IsA<ACameraActor>();
+
+			if (bRespawnedTracked)
+			{
+				Actor->Modify();
+				// Its keys are already relative to us, so KeepRelative is correct.
+				Actor->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
+
+				FTrackedActor& Tracked = ParentedByBinding.FindOrAdd(BindingId);
+				Tracked.Actor = Actor;
+				Tracked.LocalToAnchor = Actor->GetActorTransform().GetRelativeTransform(GetActorTransform());
+				continue;
+			}
+
 			// Free-floating: remember it, so that if it shows up under us later we know it was parented just now.
 			if (!CurrentParent)
 			{
 				SeenUnparented.Add(BindingId);
 			}
-
-			// New or respawned actor that we have never seen under us.
-			// Only cameras are parented automatically; every other actor is only
-			// tracked once the artist parents it themselves (handled above).
-			if (bMoveCameraOnSequenceOpen && Actor->IsA<ACameraActor>())
-			{
-				Actor->Modify(); // a possessed camera is a level actor: this marks the level dirty
-
-				const bool bAnimated = IsBindingAnimated(MovieScene, BindingId);
-
-				// First time under us and animated: convert the keys first, then attach (done after the loop).
-				if (bKeepWorldOnFirstParent && bAnimated && !ConvertedBindings.Contains(BindingId))
-				{
-					FJustParented& Item = JustParented.AddDefaulted_GetRef();
-					Item.BindingId = BindingId;
-					Item.Actor = Actor;
-					Item.bAttach = true;
-					continue;
-				}
-
-				// Static: keep where it is. Animated and already converted (a respawn): its keys are already
-				// relative to us, so KeepRelative is correct. Setting off: previous behaviour.
-				const bool bKeepWorld = bKeepWorldOnFirstParent && !bAnimated;
-				Actor->AttachToActor(this, bKeepWorld
-					? FAttachmentTransformRules::KeepWorldTransform
-					: FAttachmentTransformRules::KeepRelativeTransform);
-
-				FTrackedActor& Tracked = ParentedByBinding.FindOrAdd(BindingId);
-				Tracked.Actor = Actor;
-				Tracked.LocalToAnchor = Actor->GetActorTransform().GetRelativeTransform(GetActorTransform());
-
-				UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: attached '%s' (%s)"),
-					*Actor->GetName(), *Actor->GetClass()->GetName());
-			}
+			// No auto-parenting: every actor, cameras included, is only tracked once the artist parents it themselves.
 		}
 	}
 
@@ -537,12 +539,10 @@ void AAnimOffsetAnim::OfferKeepTransform(AActor* Actor, const FTransform& LocalT
 {
 	const FText Message = FText::Format(
 		NSLOCTEXT("CameraAnchor", "KeepPrompt",
-			"'{0}' was unparented from '{1}' and has no transform animation.\n\n"
-			"Do you want to keep the transform it had under '{1}'?\n\n"
-			"Yes: moves it to where it was sitting while parented (world space, using '{1}' as it is now).\n"
-			"No: leaves it exactly where it is now."),
-		FText::FromString(Actor->GetActorLabel()),
-		FText::FromString(GetActorLabel()));
+			"Bake with keyframes only?\n\n"
+			"Yes\n"
+			"No")
+	);
 	const FText Title = NSLOCTEXT("CameraAnchor", "KeepTitle", "Keep Transform?");
 
 	// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
@@ -606,6 +606,9 @@ bool AAnimOffsetAnim::TickChildWatcher()
 	{
 		return true;
 	}
+
+	// Picks up a Sequencer that was already open before we registered (the creation event never fires for it).
+	TryAdoptOpenSequencer();
 
 	TArray<AActor*> ChildActors;
 	GetAttachedActors(ChildActors);
@@ -833,14 +836,7 @@ void AAnimOffsetAnim::HandleActorsUnparented(ISequencer& InSequencer, const TArr
 
 	if (Animated.Num() > 0)
 	{
-		const FText Message = FText::Format(
-			NSLOCTEXT("CameraAnchor", "BakePromptMulti",
-				"{0} unparented from '{1}'.\n\n"
-				"Do you want to bake their animation as it looks under '{1}'?\n\n"
-				"Yes: re-keys each one in world space on its existing keys, so it keeps moving as it did while parented.\n"
-				"No: leaves the existing keys untouched (they will jump)."),
-			FText::FromString(AnimatedNames),
-			FText::FromString(GetActorLabel()));
+		const FText Message = NSLOCTEXT("CameraAnchor", "BakePromptMulti", "Bake with keyframes only?");
 		const FText Title = NSLOCTEXT("CameraAnchor", "BakeTitleMulti", "Bake Animation?");
 
 		// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.

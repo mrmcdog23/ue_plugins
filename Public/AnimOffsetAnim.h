@@ -25,7 +25,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	TSoftObjectPtr<ACameraActor> TargetCamera;
 
-	/** Parent cameras bound in the Sequencer under this actor whenever a Sequencer is opened (runtime: sequence-spawned cameras). */
+	/** Runtime only (PIE / MRQ / game): parent sequence-spawned cameras under this actor. No longer auto-parents in the editor. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	bool bMoveCameraOnSequenceOpen = true;
 
@@ -85,11 +85,18 @@ private:
 	void UnregisterSequencerHook();
 	void OnSequencerCreated(TSharedRef<ISequencer> InSequencer);
 
+	/** Starts the poll that watches this Sequencer's bound actors (no-op if already watching it). */
+	void StartSequencerPoll(TSharedRef<ISequencer> InSequencer);
+
+	/** Finds a Sequencer that was already open before our creation hook was registered, and starts watching it. */
+	void TryAdoptOpenSequencer();
+
 	/**
 	 * Walks every actor bound in the focused sequence (spawnables and possessables alike).
-	 * - Cameras are parented under this actor automatically.
+	 * - Nothing is parented automatically.
 	 * - Any bound actor the artist parented under this actor is remembered, and when it is later
 	 *   unparented the artist is offered a bake / keep-transform prompt.
+	 * - A tracked spawnable camera that Sequencer respawns is re-attached to this actor.
 	 */
 	void TrackBoundActors(ISequencer& InSequencer);
 
