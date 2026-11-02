@@ -11,6 +11,7 @@
 #include "Containers/Ticker.h"
 #include "Curves/RealCurve.h"
 #include "Editor.h"
+#include "Animation/SkeletalMeshActor.h"
 #include "Engine/StaticMeshActor.h"
 #include "ISequencer.h"
 #include "ISequencerModule.h"
@@ -185,8 +186,17 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 	{
 		return;
 	}
-	/*
+
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sequencer opened, watching bound actors."));
+
+	// Already watching this exact Sequencer: don't start a second poll.
+	if (ActiveSequencer.Pin() == InSequencer.ToSharedPtr())
+	{
+		return;
+	}
+
+	// Without this the child watcher has no Sequencer, so it can only offer "keep transform"
+	// and never the "bake animation" prompt for animated actors.
 	ActiveSequencer = InSequencer;
 
 	TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
@@ -215,7 +225,6 @@ void AAnimOffsetAnim::OnSequencerCreated(TSharedRef<ISequencer> InSequencer)
 			Self->TrackBoundActors(*Sequencer);
 			return true; // keep running
 		}), 0.1f);
-		*/
 }
 
 
@@ -330,6 +339,18 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 			// If it is the very same actor we saw under us earlier, and it is no longer under us,
 			// the artist unparented it. (A respawned spawnable is a different object, so it falls through.)
 			const FTrackedActor* Previous = ParentedByBinding.Find(BindingId);
+
+			// DEBUG: remove once the camera unparent issue is diagnosed.
+			if (Actor->IsA<ACameraActor>())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CameraAnchor[cam]: %s parent=%s hasPrev=%d samePtr=%d optedOut=%d"),
+					*Actor->GetName(),
+					CurrentParent ? *CurrentParent->GetName() : TEXT("none"),
+					Previous != nullptr,
+					Previous && Previous->Actor.Get() == Actor,
+					OptedOutBindings.Contains(BindingId));
+			}
+
 			if (Previous && Previous->Actor.Get() == Actor)
 			{
 				const FTransform LocalToAnchor = Previous->LocalToAnchor; // copy before Remove()
@@ -537,10 +558,14 @@ void AAnimOffsetAnim::OfferKeepTransform(AActor* Actor, const FTransform& LocalT
 }
 
 
-// The child watcher only handles static mesh actors. To cover every kind of actor, make this return true for any non-null actor.
+// The child watcher handles static mesh actors, skeletal mesh actors and cameras (ACineCameraActor derives from ACameraActor,
+// so it is covered too). To cover every kind of actor, make this return true for any non-null actor.
 static bool IsWatchedChildType(const AActor* Actor)
 {
-	return Actor && Actor->IsA<AStaticMeshActor>();
+	return Actor
+		&& (Actor->IsA<AStaticMeshActor>()
+			|| Actor->IsA<ASkeletalMeshActor>()
+			|| Actor->IsA<ACameraActor>());
 }
 
 
@@ -864,6 +889,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 	UMovieScene* MovieScene = Sequence ? Sequence->GetMovieScene() : nullptr;
 	if (!MovieScene)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: No movie scene found."));
 		return;
 	}
 
@@ -891,6 +917,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 		return;
 	}
 
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: Work out baking..."));
 	// Remember each original key so its interpolation mode survives the rewrite.
 	TArray<TMap<FFrameNumber, FMovieSceneDoubleValue>> OriginalKeys;
 	OriginalKeys.SetNum(9);
