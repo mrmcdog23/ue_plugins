@@ -6,11 +6,15 @@
 #include "Components/ArrowComponent.h"
 #include "Components/SceneComponent.h"
 #include "EngineUtils.h"   // TActorIterator
+#include "Engine/Level.h"   // ULevel::bIsVisible / IsPersistentLevel
 
 #if WITH_EDITOR
 #include "Containers/Ticker.h"
 #include "Curves/RealCurve.h"
 #include "Editor.h"
+#include "Engine/LevelStreaming.h"
+#include "Engine/World.h"
+#include "LevelUtils.h"   // FLevelUtils::IsLevelLocked (UnrealEd)
 #include "Animation/SkeletalMeshActor.h"
 #include "Engine/StaticMeshActor.h"
 #include "ISequencer.h"
@@ -52,6 +56,13 @@ void AAnimOffsetAnim::Tick(float DeltaSeconds)
 
 	// Editor viewport worlds don't tick this (ShouldTickIfViewportsOnly is false),
 	// so this only runs in PIE / MRQ / game, where the Sequencer editor hook never fires.
+	// A follower (sublevel anchor) only copies the leader. The leader in the persistent level parents the cameras.
+	if (bIsFollower)
+	{
+		SyncToLeader();
+		return;
+	}
+
 	if (bMoveCameraOnSequenceOpen)
 	{
 		AttachRuntimeCameras();
@@ -59,18 +70,96 @@ void AAnimOffsetAnim::Tick(float DeltaSeconds)
 }
 
 
-void AAnimOffsetAnim::AttachRuntimeCameras()
+AAnimOffsetAnim* AAnimOffsetAnim::FindLeader() const
 {
-	UWorld* World = GetWorld();
-	if (!World || !World->IsGameWorld())
+	const UWorld* World = GetWorld();
+	const ULevel* Persistent = World ? World->PersistentLevel.Get() : nullptr;
+	if (!Persistent)
+	{
+		return nullptr;
+	}
+
+	for (AActor* Candidate : Persistent->Actors)
+	{
+		AAnimOffsetAnim* Anchor = Cast<AAnimOffsetAnim>(Candidate);
+		if (Anchor && Anchor != this && !Anchor->bIsFollower && IsValid(Anchor))
+		{
+			return Anchor;
+		}
+	}
+	return nullptr;
+}
+
+
+void AAnimOffsetAnim::SyncToLeader()
+{
+	if (!bIsFollower)
 	{
 		return;
 	}
 
-	// Explicit level camera
+	AAnimOffsetAnim* Leader = CachedLeader.Get();
+	if (!Leader || Leader->bIsFollower)
+	{
+		// Scanning the persistent level is not free, so look for a leader at most once a second.
+		const double Now = FPlatformTime::Seconds();
+		if (Now < NextLeaderSearchTime)
+		{
+			return;
+		}
+		NextLeaderSearchTime = Now + 1.0;
+
+		Leader = FindLeader();
+		CachedLeader = Leader;
+		if (!Leader)
+		{
+			return;
+		}
+	}
+
+	// World space copy: works with sublevel offsets too, because actor transforms are already world space.
+	const FTransform Target = Leader->GetActorTransform();
+	if (!GetActorTransform().Equals(Target, 1e-4))
+	{
+		SetActorTransform(Target, false, nullptr, ETeleportType::TeleportPhysics);
+	}
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Level helper (persistent level + streaming sublevels)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * True if the actor is alive and sits in a level that is currently loaded and visible in its world.
+ * An actor in a hidden or still-streaming sublevel is not "live": its components are unregistered,
+ * so its attachments cannot be trusted (a hidden sublevel must not look like "the artist unparented it").
+ */
+static bool IsActorInLiveLevel(const AActor* Actor)
+{
+	if (!IsValid(Actor) || Actor->IsActorBeingDestroyed() || !Actor->GetWorld())
+	{
+		return false;
+	}
+	const ULevel* Level = Actor->GetLevel();
+	return Level && (Level->IsPersistentLevel() || Level->bIsVisible);
+}
+
+
+void AAnimOffsetAnim::AttachRuntimeCameras()
+{
+	UWorld* World = GetWorld();
+	if (!World || !World->IsGameWorld() || !IsActorInLiveLevel(this))
+	{
+		return;
+	}
+
+	// Explicit level camera. It may live in a sublevel that is not streamed in yet (soft pointer resolves to null until then).
+	// Only claim it if no anchor owns it already, so anchors in several levels don't steal it back and forth every tick.
 	if (ACameraActor* Target = TargetCamera.Get())
 	{
-		if (Target->GetAttachParentActor() != this)
+		const AActor* TargetParent = Target->GetAttachParentActor();
+		if (IsActorInLiveLevel(Target) && (!TargetParent || !TargetParent->IsA<AAnimOffsetAnim>()))
 		{
 			Target->AttachToActor(this, FAttachmentTransformRules::KeepRelativeTransform);
 		}
@@ -82,7 +171,12 @@ void AAnimOffsetAnim::AttachRuntimeCameras()
 
 		// Only sequence-spawned cameras. Placed level cameras are net-startup actors
 		// (their parent, if any, was saved with the level and is already in place).
-		if (Camera->IsNetStartupActor() || Camera->GetAttachParentActor() == this)
+		// Skip cameras already under ANY anchor (this one, or another anchor in the persistent level / a sublevel),
+		// otherwise two anchors would re-parent the same camera every tick. The first anchor to tick claims it.
+		const AActor* CameraParent = Camera->GetAttachParentActor();
+		if (Camera->IsNetStartupActor()
+			|| (CameraParent && CameraParent->IsA<AAnimOffsetAnim>())
+			|| !IsActorInLiveLevel(Camera))
 		{
 			continue;
 		}
@@ -95,6 +189,8 @@ void AAnimOffsetAnim::AttachRuntimeCameras()
 
 
 #if WITH_EDITOR
+
+bool AAnimOffsetAnim::bPromptOpen = false;
 
 // ---------------------------------------------------------------------------------------------
 // Transform section helpers
@@ -164,6 +260,7 @@ void AAnimOffsetAnim::PostActorCreated()
 	Super::PostActorCreated();
 	RegisterSequencerHook();
 	StartChildWatcher();
+	StartFollowerSync();
 }
 
 void AAnimOffsetAnim::PostLoad()
@@ -171,6 +268,7 @@ void AAnimOffsetAnim::PostLoad()
 	Super::PostLoad();
 	RegisterSequencerHook();
 	StartChildWatcher();
+	StartFollowerSync();
 }
 
 void AAnimOffsetAnim::BeginDestroy()
@@ -269,6 +367,14 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 		return;
 	}
 
+	// This anchor sits in a hidden / loading sublevel: its attachment data is not reliable right now.
+	if (!IsActorInLiveLevel(this))
+	{
+		return;
+	}
+
+	SyncToLeader(); // follower: children are measured against the leader's current transform
+
 	UMovieSceneSequence* Sequence = InSequencer.GetFocusedMovieSceneSequence();
 	UMovieScene* MovieScene = Sequence ? Sequence->GetMovieScene() : nullptr;
 	if (!MovieScene)
@@ -313,6 +419,13 @@ void AAnimOffsetAnim::TrackBoundActors(ISequencer& InSequencer)
 
 			// Never track ourselves, or one of our own ancestors (attaching that would be a cycle).
 			if (Actor == this || IsAttachedTo(Actor))
+			{
+				continue;
+			}
+
+			// Bound actor lives in a sublevel that is hidden / still streaming: hiding a level unregisters its components,
+			// which would otherwise look like the artist unparented it. Ignore it until the level is visible again.
+			if (!IsActorInLiveLevel(Actor))
 			{
 				continue;
 			}
@@ -475,6 +588,7 @@ void AAnimOffsetAnim::ConvertKeysToAnchorSpace(ISequencer& InSequencer, const FG
 
 		InSequencer.SetLocalTime(FFrameTime(Time));
 		InSequencer.ForceEvaluate();
+		SyncToLeader(); // follower: take the leader's transform at this time right now, not on the next tick
 		const FTransform AnchorWorld = GetActorTransform();
 
 		NewRelative.Add(World.GetRelativeTransform(AnchorWorld));
@@ -537,17 +651,17 @@ void AAnimOffsetAnim::ConvertKeysToAnchorSpace(ISequencer& InSequencer, const FG
 
 void AAnimOffsetAnim::OfferKeepTransform(AActor* Actor, const FTransform& LocalToAnchor)
 {
-	const FText Message = FText::Format(
-		NSLOCTEXT("CameraAnchor", "KeepPrompt",
-			"Bake with keyframes only?\n\n"
-			"Yes\n"
-			"No")
-	);
+	const FText Message = NSLOCTEXT("CameraAnchor", "KeepPrompt",
+		"Bake with keyframes only?\n\n"
+		"Yes\n"
+		"No");
 	const FText Title = NSLOCTEXT("CameraAnchor", "KeepTitle", "Keep Transform?");
 
 	// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
 	if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
 	{
+		SyncToLeader();
+
 		// Child-in-anchor-space * anchor-in-world = where it was sitting while parented.
 		const FTransform DesiredWorld = LocalToAnchor * GetActorTransform();
 
@@ -607,8 +721,27 @@ bool AAnimOffsetAnim::TickChildWatcher()
 		return true;
 	}
 
+	// Anchor itself is in a hidden / still-streaming sublevel: wait until it is live.
+	if (!IsActorInLiveLevel(this))
+	{
+		return true;
+	}
+
+	SyncToLeader();
+
 	// Picks up a Sequencer that was already open before we registered (the creation event never fires for it).
 	TryAdoptOpenSequencer();
+
+	// Leader: keep one follower alive in every loaded sublevel (checked once a second).
+	if (!bIsFollower && bAutoCreateSublevelFollowers)
+	{
+		const double Now = FPlatformTime::Seconds();
+		if (Now >= NextFollowerCheckTime)
+		{
+			NextFollowerCheckTime = Now + 1.0;
+			EnsureSublevelFollowers(false);
+		}
+	}
 
 	TArray<AActor*> ChildActors;
 	GetAttachedActors(ChildActors);
@@ -616,7 +749,7 @@ bool AAnimOffsetAnim::TickChildWatcher()
 	// Add new static meshes, and refresh where each one sits relative to us.
 	for (AActor* Child : ChildActors)
 	{
-		if (!IsWatchedChildType(Child))
+		if (!IsWatchedChildType(Child) || !IsActorInLiveLevel(Child))
 		{
 			continue;
 		}
@@ -649,6 +782,14 @@ bool AAnimOffsetAnim::TickChildWatcher()
 		if (Actor && ChildActors.Contains(Actor))
 		{
 			continue; // still ours
+		}
+
+		// The child sits in a sublevel that was hidden (or is mid-unload). That drops it from our attached list
+		// but is NOT an unparent: keep watching, it is picked up again when the level is shown.
+		if (IsValid(Actor) && Actor->GetLevel()
+			&& !Actor->GetLevel()->IsPersistentLevel() && !Actor->GetLevel()->bIsVisible)
+		{
+			continue;
 		}
 
 		// Only a real "unparent" if the actor still exists, is free-floating (not re-parented elsewhere),
@@ -780,6 +921,8 @@ void AAnimOffsetAnim::OfferKeepTransforms(const TArray<FUnparentedItem>& Items)
 	// NOTE: on UE 5.0-5.2 the title parameter is a pointer: pass &Title instead.
 	if (FMessageDialog::Open(EAppMsgType::YesNo, Message, Title) == EAppReturnType::Yes)
 	{
+		SyncToLeader();
+
 		const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "KeepTransactionMulti", "Keep Transform After Unparent"));
 		for (const FUnparentedItem* Item : Valid)
 		{
@@ -941,6 +1084,7 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 
 		InSequencer.SetLocalTime(FFrameTime(Time));
 		InSequencer.ForceEvaluate();
+		SyncToLeader(); // follower: take the leader's transform at this time right now, not on the next tick
 
 		SampleTimes.Add(Time);
 		SampleTransforms.Add(LocalToAnchor * GetActorTransform());
@@ -1012,6 +1156,119 @@ void AAnimOffsetAnim::BakeActorToWorld(ISequencer& InSequencer, const FGuid& Bin
 	InSequencer.ForceEvaluate(); // the new world keys now drive the (unparented) actor
 
 	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: baked %d keys to world space."), SampleTimes.Num());
+}
+
+
+void AAnimOffsetAnim::StartFollowerSync()
+{
+	if (HasAnyFlags(RF_ClassDefaultObject) || bFollowerSyncStarted)
+	{
+		return;
+	}
+	bFollowerSyncStarted = true;
+
+	// Every frame (interval 0): a follower must track the leader while the artist scrubs / drags it, not 0.1 s later.
+	TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis](float)
+		{
+			AAnimOffsetAnim* Self = WeakThis.Get();
+			if (!Self)
+			{
+				return false;
+			}
+
+			UWorld* World = Self->GetWorld();
+			if (!GEditor || !World)
+			{
+				return true; // not ready yet
+			}
+			if (World->IsGameWorld())
+			{
+				return false; // PIE copy: AActor::Tick does the syncing there
+			}
+			if (Self->bIsFollower && World == GEditor->GetEditorWorldContext().World())
+			{
+				Self->SyncToLeader();
+			}
+			return true;
+		}), 0.0f);
+}
+
+
+void AAnimOffsetAnim::CreateSublevelFollowers()
+{
+	EnsureSublevelFollowers(true);
+}
+
+
+void AAnimOffsetAnim::EnsureSublevelFollowers(bool bManual)
+{
+	UWorld* World = GetWorld();
+	ULevel* MyLevel = GetLevel();
+
+	// Only a real leader in the persistent level of the editor world: not a follower, not a drag-preview / template actor.
+	const bool bCanLead = GEditor && World && !World->IsGameWorld()
+		&& !bIsFollower && !IsTemplate() && !HasAnyFlags(RF_Transient)
+		&& MyLevel && MyLevel->IsPersistentLevel();
+
+	if (!bCanLead)
+	{
+		if (bManual)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: sublevel followers can only be created from an anchor placed in the persistent level."));
+		}
+		return;
+	}
+
+	int32 Created = 0;
+
+	for (ULevelStreaming* Streaming : World->GetStreamingLevels())
+	{
+		ULevel* Level = Streaming ? Streaming->GetLoadedLevel() : nullptr;
+		if (!Level || !Level->bIsVisible || FLevelUtils::IsLevelLocked(Level))
+		{
+			continue;
+		}
+
+		// One anchor per sublevel is enough. An anchor the artist placed there themselves is left alone (it works on its own).
+		bool bHasAnchor = false;
+		for (AActor* Existing : Level->Actors)
+		{
+			if (Existing && Existing->IsA<AAnimOffsetAnim>())
+			{
+				bHasAnchor = true;
+				break;
+			}
+		}
+		if (bHasAnchor)
+		{
+			continue;
+		}
+
+		FActorSpawnParameters Params;
+		Params.OverrideLevel = Level; // spawn INTO the sublevel, so actors there can be parented to it
+		Params.ObjectFlags = RF_Transactional;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+		AAnimOffsetAnim* Follower = World->SpawnActor<AAnimOffsetAnim>(GetClass(), GetActorTransform(), Params);
+		if (!Follower)
+		{
+			continue;
+		}
+
+		Follower->bIsFollower = true;
+		Follower->SetActorLabel(FString::Printf(TEXT("%s_Follower_%s"), *GetActorLabel(), *Streaming->GetWorldAssetPackageFName().ToString()));
+		Follower->MarkPackageDirty();
+		++Created;
+
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: created follower '%s' in sublevel '%s'."),
+			*Follower->GetActorLabel(), *Streaming->GetWorldAssetPackageFName().ToString());
+	}
+
+	if (bManual && Created == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: no sublevel needed a follower (all loaded, visible, unlocked sublevels already have an anchor)."));
+	}
 }
 
 

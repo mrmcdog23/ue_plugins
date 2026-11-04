@@ -48,6 +48,28 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor")
 	bool bPromptToBakeOnUnparent = true;
 
+	/**
+	 * Unreal only lets actors be parented to an actor in the SAME level. So an anchor placed in the persistent level cannot
+	 * be the parent of sublevel actors. Instead, the leader (an anchor in the persistent level) keeps one FOLLOWER anchor in each
+	 * loaded sublevel. Followers copy the leader's world transform every frame; parent sublevel actors to the follower.
+	 * Move / animate / key the LEADER only. A follower that is moved by hand snaps back to the leader.
+	 *
+	 * Editor only: automatically creates a follower in every loaded, visible, unlocked sublevel that has no anchor yet.
+	 * Untick this if you delete a follower on purpose, otherwise it is created again.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Anchor|Sublevels")
+	bool bAutoCreateSublevelFollowers = true;
+
+	/** Set on the anchors that are created in sublevels. They follow the leader and never parent runtime cameras. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera Anchor|Sublevels")
+	bool bIsFollower = false;
+
+#if WITH_EDITOR
+	/** Creates a follower anchor in every loaded sublevel that has no anchor yet (the leader must be in the persistent level). */
+	UFUNCTION(CallInEditor, Category = "Camera Anchor|Sublevels")
+	void CreateSublevelFollowers();
+#endif
+
 protected:
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<USceneComponent> Root;
@@ -61,6 +83,15 @@ protected:
 	 */
 	UPROPERTY()
 	TSet<FGuid> ConvertedBindings;
+
+	/** The leader a follower copies: the first non-follower anchor in the persistent level. Null if there is none. */
+	AAnimOffsetAnim* FindLeader() const;
+
+	/** Follower only: snap this actor to the leader's world transform (no-op if already there or no leader is found). */
+	void SyncToLeader();
+
+	TWeakObjectPtr<AAnimOffsetAnim> CachedLeader;
+	double NextLeaderSearchTime = 0.0;
 
 	/** Runtime (PIE / MRQ / game): parent sequence-spawned cameras under this actor. */
 	void AttachRuntimeCameras();
@@ -145,6 +176,15 @@ private:
 	/** Starts the Sequencer-independent poll that watches static meshes parented under this actor. */
 	void StartChildWatcher();
 
+	/** Starts a per-frame editor ticker that keeps a follower on its leader (editor viewports do not tick actors). */
+	void StartFollowerSync();
+
+	/** Leader only: spawn a follower into every loaded sublevel that has no anchor. bManual = called from the button. */
+	void EnsureSublevelFollowers(bool bManual);
+
+	bool bFollowerSyncStarted = false;
+	double NextFollowerCheckTime = 0.0;
+
 	/** One poll of the child watcher. Returns false to stop ticking. */
 	bool TickChildWatcher();
 
@@ -159,7 +199,8 @@ private:
 	/** Bindings seen free-floating this session. If one later appears under us, the artist just parented it. */
 	TSet<FGuid> SeenUnparented;
 
-	bool bPromptOpen = false;
+	/** Shared by every anchor: only one bake / keep prompt may be open at a time, whichever anchor raised it. */
+	static bool bPromptOpen;
 
 	/** A static mesh currently parented under this actor, and where it sits relative to us (last observed). */
 	struct FWatchedChild
