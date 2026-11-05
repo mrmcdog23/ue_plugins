@@ -13,6 +13,12 @@
 #include "Curves/RealCurve.h"
 #include "Editor.h"
 #include "Engine/LevelStreaming.h"
+#include "Engine/Selection.h"
+#include "FileHelpers.h"   // FEditorFileUtils (UnrealEd)
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Engine/World.h"
 #include "LevelUtils.h"   // FLevelUtils::IsLevelLocked (UnrealEd)
 #include "Animation/SkeletalMeshActor.h"
@@ -191,6 +197,7 @@ void AAnimOffsetAnim::AttachRuntimeCameras()
 #if WITH_EDITOR
 
 bool AAnimOffsetAnim::bPromptOpen = false;
+bool AAnimOffsetAnim::bSuppressCreationHooks = false;
 
 // ---------------------------------------------------------------------------------------------
 // Transform section helpers
@@ -258,9 +265,44 @@ static void SetKeyValueAt(FMovieSceneDoubleChannel* Channel, FFrameNumber Time, 
 void AAnimOffsetAnim::PostActorCreated()
 {
 	Super::PostActorCreated();
+	if (bSuppressCreationHooks)
+	{
+		return; // spawned into a background-loaded parent map: nothing to hook
+	}
 	RegisterSequencerHook();
 	StartChildWatcher();
 	StartFollowerSync();
+
+	// Deferred: SpawnActor() sets bIsFollower only AFTER PostActorCreated, so a follower cannot be told apart yet.
+	// Dragging an anchor into the viewport first creates a TRANSIENT preview actor whose flag is cleared on drop,
+	// so keep polling while it is transient and relocate once it is a real actor.
+	if (!HasAnyFlags(RF_ClassDefaultObject))
+	{
+		TWeakObjectPtr<AAnimOffsetAnim> WeakThis(this);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakThis](float)
+			{
+				AAnimOffsetAnim* Self = WeakThis.Get();
+				if (!Self || Self->IsTemplate())
+				{
+					return false; // preview was cancelled / destroyed
+				}
+				UWorld* World = Self->GetWorld();
+				if (!World)
+				{
+					return true; // not ready yet
+				}
+				if (World->IsGameWorld())
+				{
+					return false;
+				}
+				if (Self->HasAnyFlags(RF_Transient))
+				{
+					return true; // still a drag preview
+				}
+				Self->RelocateToPersistentLevelIfNeeded();
+				return false; // one shot once it is real
+			}), 0.0f);
+	}
 }
 
 void AAnimOffsetAnim::PostLoad()
@@ -1192,6 +1234,239 @@ void AAnimOffsetAnim::StartFollowerSync()
 			}
 			return true;
 		}), 0.0f);
+}
+
+
+void AAnimOffsetAnim::RelocateToPersistentLevelIfNeeded()
+{
+	UWorld* World = GetWorld();
+	ULevel* MyLevel = GetLevel();
+
+	// A sublevel opened ON ITS OWN is the persistent level of that editor world, so there is nowhere to relocate to.
+	// Look for maps that stream this one and tell the artist to open one of them instead.
+	if (GEditor && World && !World->IsGameWorld() && MyLevel && IsValid(this)
+		&& !IsTemplate() && !HasAnyFlags(RF_Transient) && !bIsFollower
+		&& MyLevel->IsPersistentLevel() && World->GetStreamingLevels().Num() == 0)
+	{
+		const FName ThisPackage = World->GetOutermost()->GetFName();
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+
+		TArray<FName> Referencers;
+		Registry.GetReferencers(ThisPackage, Referencers);
+
+		TArray<FString> ParentMaps;
+		TArray<FName> ParentPackages;
+		for (const FName& Referencer : Referencers)
+		{
+			if (Referencer == ThisPackage)
+			{
+				continue;
+			}
+			TArray<FAssetData> Assets;
+			Registry.GetAssetsByPackageName(Referencer, Assets);
+			for (const FAssetData& Asset : Assets)
+			{
+				if (Asset.AssetClassPath == UWorld::StaticClass()->GetClassPathName())
+				{
+					ParentMaps.AddUnique(Asset.AssetName.ToString());
+					ParentPackages.AddUnique(Referencer);
+					break;
+				}
+			}
+		}
+
+		if (ParentMaps.Num() > 0)
+		{
+			const FString Parents = FString::Join(ParentMaps, TEXT(", "));
+			const FString ChosenParent = ParentMaps[0];
+
+			bool bDone = CreateLeaderInParentMap(ParentPackages[0], GetActorTransform());
+			if (bDone)
+			{
+				// This one is exactly what the leader would have auto-created for this sublevel: make it the follower.
+				bIsFollower = true;
+				SetActorLabel(FString::Printf(TEXT("%s_Follower_%s"), TEXT("AnimOffsetAnim"), *World->GetName()));
+				MarkPackageDirty();
+			}
+
+			FNotificationInfo Info(FText::FromString(bDone
+				? FString::Printf(TEXT("Camera Anchor: created in '%s' and saved. This anchor is now the sublevel follower - save this map too."), *ChosenParent)
+				: FString::Printf(TEXT("Camera Anchor: not created. Open '%s' to place the anchor in the persistent level."), *Parents)));
+			Info.ExpireDuration = 10.0f;
+			FSlateNotificationManager::Get().AddNotification(Info);
+		}
+		return;
+	}
+
+	if (!GEditor || !World || World->IsGameWorld() || !MyLevel || !IsValid(this)
+		|| IsTemplate() || HasAnyFlags(RF_Transient)
+		|| bIsFollower                      // followers are SUPPOSED to live in sublevels
+		|| MyLevel->IsPersistentLevel())    // already where it belongs
+	{
+		UE_LOG(LogTemp, Log, TEXT("CameraAnchor: relocate skipped for '%s' (follower=%d, persistent=%d, transient=%d, template=%d)"),
+			*GetName(), bIsFollower, MyLevel && MyLevel->IsPersistentLevel(), HasAnyFlags(RF_Transient), IsTemplate());
+		if (World && MyLevel)
+		{
+			UE_LOG(LogTemp, Log, TEXT("CameraAnchor: level info -> actor level='%s', persistent='%s', current level='%s', world='%s', streaming levels=%d"),
+				*GetNameSafe(MyLevel->GetOuter()),
+				*GetNameSafe(World->PersistentLevel ? World->PersistentLevel->GetOuter() : nullptr),
+				*GetNameSafe(World->GetCurrentLevel() ? World->GetCurrentLevel()->GetOuter() : nullptr),
+				*World->GetName(), World->GetStreamingLevels().Num());
+		}
+		return;
+	}
+
+	ULevel* Persistent = World->PersistentLevel.Get();
+	if (!Persistent)
+	{
+		return;
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "MoveToPersistent", "Move Camera Anchor to Persistent Level"));
+
+	// Re-use a leader that already exists in the persistent level instead of making a second one.
+	AAnimOffsetAnim* Leader = nullptr;
+	for (AActor* Candidate : Persistent->Actors)
+	{
+		AAnimOffsetAnim* Anchor = Cast<AAnimOffsetAnim>(Candidate);
+		if (Anchor && Anchor != this && !Anchor->bIsFollower && IsValid(Anchor))
+		{
+			Leader = Anchor;
+			break;
+		}
+	}
+
+	if (!Leader)
+	{
+		FActorSpawnParameters Params;
+		Params.OverrideLevel = Persistent;
+		Params.ObjectFlags = RF_Transactional;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+		Leader = World->SpawnActor<AAnimOffsetAnim>(GetClass(), GetActorTransform(), Params);
+		if (!Leader)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: could not create an anchor in the persistent level; keeping the sublevel one."));
+			return;
+		}
+
+		// Carry over the artist's settings and name.
+		Leader->TargetCamera = TargetCamera;
+		Leader->bMoveCameraOnSequenceOpen = bMoveCameraOnSequenceOpen;
+		Leader->bKeepWorldOnFirstParent = bKeepWorldOnFirstParent;
+		Leader->bPromptToBakeOnUnparent = bPromptToBakeOnUnparent;
+		Leader->bAutoCreateSublevelFollowers = bAutoCreateSublevelFollowers;
+		Leader->SetActorLabel(GetActorLabel());
+		Leader->MarkPackageDirty();
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: '%s' was created in a sublevel; deleted it and used '%s' in the persistent level instead."),
+		*GetActorLabel(), *Leader->GetActorLabel());
+
+	// Hand the selection to the persistent anchor, then remove this one.
+	if (GEditor->GetSelectedActors()->IsSelected(this))
+	{
+		GEditor->SelectNone(false, true);
+		GEditor->SelectActor(Leader, true, true);
+	}
+	World->EditorDestroyActor(this, true);
+
+	// This sublevel no longer has an anchor, so it gets a follower (the leader must be the one in the persistent level).
+	if (Leader->bAutoCreateSublevelFollowers)
+	{
+		Leader->EnsureSublevelFollowers(false);
+	}
+}
+
+
+bool AAnimOffsetAnim::CreateLeaderInParentMap(FName ParentPackageName, const FTransform& SublevelTransform)
+{
+	const FName ThisPackage = GetWorld() ? GetWorld()->GetOutermost()->GetFName() : NAME_None;
+
+	UPackage* ParentPackage = LoadPackage(nullptr, *ParentPackageName.ToString(), LOAD_None);
+	UWorld* ParentWorld = ParentPackage ? UWorld::FindWorldInPackage(ParentPackage) : nullptr;
+	if (!ParentWorld)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: could not load parent map '%s'."), *ParentPackageName.ToString());
+		return false;
+	}
+
+	// Bring the map up just far enough to spawn into it (same approach editor commandlets use), without opening it.
+	const bool bWasInitialized = ParentWorld->bIsWorldInitialized;
+	if (!bWasInitialized)
+	{
+		ParentWorld->AddToRoot();
+		ParentWorld->WorldType = EWorldType::Editor;
+		ParentWorld->InitWorld(UWorld::InitializationValues()
+			.InitializeScenes(false).AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(false)
+			.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).EnableTraceCollision(false)
+			.SetTransactional(false).CreateFXSystem(false));
+	}
+
+	ULevel* ParentPersistent = ParentWorld->PersistentLevel.Get();
+	bool bSuccess = false;
+
+	if (ParentPersistent)
+	{
+		// Already has a leader? Then only the follower conversion is needed, nothing to create or save.
+		bool bHasLeader = false;
+		for (AActor* Existing : ParentPersistent->Actors)
+		{
+			const AAnimOffsetAnim* Anchor = Cast<AAnimOffsetAnim>(Existing);
+			if (Anchor && !Anchor->bIsFollower)
+			{
+				bHasLeader = true;
+				break;
+			}
+		}
+
+		if (bHasLeader)
+		{
+			bSuccess = true;
+		}
+		else
+		{
+			// Our transform is in this sublevel's own space; the parent may stream it with an offset.
+			FTransform LeaderTransform = SublevelTransform;
+			for (ULevelStreaming* Streaming : ParentWorld->GetStreamingLevels())
+			{
+				if (Streaming && Streaming->GetWorldAssetPackageFName() == ThisPackage)
+				{
+					LeaderTransform = SublevelTransform * Streaming->LevelTransform;
+					break;
+				}
+			}
+
+			FActorSpawnParameters Params;
+			Params.OverrideLevel = ParentPersistent;
+			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+			bSuppressCreationHooks = true;
+			AAnimOffsetAnim* Leader = ParentWorld->SpawnActor<AAnimOffsetAnim>(GetClass(), LeaderTransform, Params);
+			bSuppressCreationHooks = false;
+
+			if (Leader)
+			{
+				Leader->TargetCamera = TargetCamera;
+				Leader->bMoveCameraOnSequenceOpen = bMoveCameraOnSequenceOpen;
+				Leader->bKeepWorldOnFirstParent = bKeepWorldOnFirstParent;
+				Leader->bPromptToBakeOnUnparent = bPromptToBakeOnUnparent;
+				Leader->bAutoCreateSublevelFollowers = bAutoCreateSublevelFollowers;
+				Leader->SetActorLabel(TEXT("AnimOffsetAnim"));
+				ParentPackage->MarkPackageDirty();
+
+				bSuccess = FEditorFileUtils::PromptForCheckoutAndSave({ ParentPackage }, false, false) != FEditorFileUtils::PR_Failure;
+				UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: created leader in '%s' (saved=%d)."), *ParentPackageName.ToString(), bSuccess);
+			}
+		}
+	}
+
+	if (!bWasInitialized)
+	{
+		ParentWorld->CleanupWorld();
+		ParentWorld->RemoveFromRoot();
+	}
+	return bSuccess;
 }
 
 

@@ -31,7 +31,8 @@ public class ControlChaos : ModuleRules
                 "LevelSequence",
                 "MovieScene",
                 "Sequencer",
-                "MovieSceneTracks"
+                "MovieSceneTracks",
+                "AssetRegistry"
             });
 
 
@@ -44,6 +45,7 @@ public class ControlChaos : ModuleRules
                 "Slate",
                 "SlateCore",
                 "Sequencer",
+                "AssetRegistry"
             }
         );
 

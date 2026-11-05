@@ -176,6 +176,21 @@ private:
 	/** Starts the Sequencer-independent poll that watches static meshes parented under this actor. */
 	void StartChildWatcher();
 
+	/**
+	 * Editor only: if this anchor was just created by the artist in a sublevel (not a follower), delete it and
+	 * make sure an anchor exists in the persistent level instead (re-using the existing leader if there is one).
+	 */
+	void RelocateToPersistentLevelIfNeeded();
+
+	/**
+	 * This map was opened on its own but is streamed by another map. Loads that parent map in the background, adds a leader
+	 * anchor to ITS persistent level (at this anchor's transform, with the streaming offset applied), and saves it.
+	 */
+	bool CreateLeaderInParentMap(FName ParentPackageName, const FTransform& SublevelTransform);
+
+	/** True while we spawn an anchor into a background-loaded map: skips the per-actor editor hooks / tickers. */
+	static bool bSuppressCreationHooks;
+
 	/** Starts a per-frame editor ticker that keeps a follower on its leader (editor viewports do not tick actors). */
 	void StartFollowerSync();
 
