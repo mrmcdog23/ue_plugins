@@ -45,6 +45,7 @@ public class ControlChaos : ModuleRules
                 "Slate",
                 "SlateCore",
                 "Sequencer",
+                "Projects",
                 "AssetRegistry"
             }
         );

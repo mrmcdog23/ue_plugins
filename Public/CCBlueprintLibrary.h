@@ -14,7 +14,7 @@ public:
 
 	/** Send a toast msg to the user */
 	UFUNCTION(BlueprintCallable, Category = "No8|EditorScripting")
-	static void PopupMessage(FString Message, float Duration, bool bSuccess);
+	static void PopupMessage(FString Message, FString iconName, float Duration, bool bSuccess);
 
 };
 
