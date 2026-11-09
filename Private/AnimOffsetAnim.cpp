@@ -35,6 +35,13 @@
 #include "Channels/MovieSceneDoubleChannel.h"
 #include "Sections/MovieScene3DTransformSection.h"
 #include "Tracks/MovieScene3DTransformTrack.h"
+#include "DragAndDrop/ActorDragDropOp.h"             // UnrealEd
+#include "Framework/Application/IInputProcessor.h"   // Slate
+#include "Framework/Application/SlateApplication.h"
+#include "Input/Events.h"
+#include "InputCoreTypes.h"
+#include "SceneOutlinerDragDrop.h"                   // module "SceneOutliner"
+#include "Widgets/Text/STextBlock.h"
 #endif
 
 
@@ -270,6 +277,7 @@ void AAnimOffsetAnim::PostActorCreated()
 		return; // spawned into a background-loaded parent map: nothing to hook
 	}
 	RegisterSequencerHook();
+	RegisterOutlinerDropHook();
 	StartChildWatcher();
 	StartFollowerSync();
 
@@ -309,12 +317,14 @@ void AAnimOffsetAnim::PostLoad()
 {
 	Super::PostLoad();
 	RegisterSequencerHook();
+	RegisterOutlinerDropHook();
 	StartChildWatcher();
 	StartFollowerSync();
 }
 
 void AAnimOffsetAnim::BeginDestroy()
 {
+	UnregisterOutlinerDropHook();
 	UnregisterSequencerHook();
 	Super::BeginDestroy();
 }
@@ -1467,6 +1477,325 @@ bool AAnimOffsetAnim::CreateLeaderInParentMap(FName ParentPackageName, const FTr
 		ParentWorld->RemoveFromRoot();
 	}
 	return bSuccess;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Outliner drop: a sublevel actor dropped on the leader is parented to the follower of its own level.
+//
+// Unreal rejects that drop (actors can only be parented inside one level), so the drop itself does nothing.
+// A Slate pre-processor sees the mouse release while the drag is still alive, works out which Outliner row is under the cursor,
+// and, if that row is a leader anchor, queues the parenting for the next tick. One listener is shared by all anchors.
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	/** The actors being dragged out of the World Outliner (empty for any other drag, e.g. an asset). */
+	void GatherDraggedActors(const TSharedPtr<FDragDropOperation>& Operation, TArray<TWeakObjectPtr<AActor>>& OutActors)
+	{
+		if (!Operation.IsValid())
+		{
+			return;
+		}
+
+		TSharedPtr<FActorDragDropOp> ActorOp;
+		if (Operation->IsOfType<FSceneOutlinerDragDropOp>())
+		{
+			ActorOp = StaticCastSharedPtr<FSceneOutlinerDragDropOp>(Operation)->GetSubOp<FActorDragDropOp>();
+		}
+		else if (Operation->IsOfType<FActorDragDropOp>())
+		{
+			ActorOp = StaticCastSharedPtr<FActorDragDropOp>(Operation);
+		}
+
+		if (ActorOp.IsValid())
+		{
+			for (const TWeakObjectPtr<AActor>& Dragged : ActorOp->Actors)
+			{
+				if (Dragged.IsValid())
+				{
+					OutActors.Add(Dragged);
+				}
+			}
+		}
+	}
+
+	/** Text of every STextBlock in the widget's subtree (the Outliner row's label is one of them). */
+	void CollectTexts(SWidget& Widget, TArray<FString>& OutTexts)
+	{
+		if (Widget.GetType() == FName(TEXT("STextBlock")))
+		{
+			OutTexts.Add(static_cast<STextBlock&>(Widget).GetText().ToString());
+		}
+		if (FChildren* Children = Widget.GetChildren())
+		{
+			Children->ForEachWidget([&OutTexts](SWidget& Child) { CollectTexts(Child, OutTexts); });
+		}
+	}
+
+	/**
+	 * Which leader's Outliner row is under the cursor, if any.
+	 * Walks up from the widget under the cursor to the first ancestor that contains an actor's label. If that is a row it holds exactly
+	 * one label (its own). If the cursor is over empty space, that ancestor is the whole list and holds many, which is rejected.
+	 */
+	AAnimOffsetAnim* FindLeaderUnderCursor(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, UWorld* World,
+		const TArray<AAnimOffsetAnim*>& Leaders)
+	{
+		FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
+			MouseEvent.GetScreenSpacePosition(), SlateApp.GetInteractiveTopLevelWindows(), false, MouseEvent.GetUserIndex());
+		if (!Path.IsValid())
+		{
+			return nullptr;
+		}
+
+		TSet<FString> ActorLabels;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			ActorLabels.Add(It->GetActorLabel());
+		}
+
+		for (int32 Index = Path.Widgets.Num() - 1; Index >= 0; --Index)
+		{
+			TArray<FString> Texts;
+			CollectTexts(Path.Widgets[Index].Widget.Get(), Texts);
+
+			TSet<FString> Matched;
+			for (const FString& Text : Texts)
+			{
+				if (ActorLabels.Contains(Text))
+				{
+					Matched.Add(Text);
+				}
+			}
+
+			if (Matched.Num() == 0)
+			{
+				continue; // keep climbing
+			}
+			if (Matched.Num() > 1)
+			{
+				return nullptr; // the whole list, so the cursor is not on one row
+			}
+
+			const FString& RowLabel = *Matched.CreateConstIterator();
+			for (AAnimOffsetAnim* Leader : Leaders)
+			{
+				if (Leader->GetActorLabel() == RowLabel)
+				{
+					return Leader;
+				}
+			}
+			return nullptr; // some other actor's row
+		}
+		return nullptr;
+	}
+
+	class FOutlinerDropProcessor : public IInputProcessor
+	{
+	public:
+		virtual void Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor) override {}
+
+		virtual const TCHAR* GetDebugName() const override { return TEXT("AnimOffsetAnimOutlinerDrop"); }
+
+		virtual bool HandleMouseButtonUpEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent) override
+		{
+			if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton || !SlateApp.IsDragDropping())
+			{
+				return false;
+			}
+
+			UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+			if (!World)
+			{
+				return false;
+			}
+
+			TArray<TWeakObjectPtr<AActor>> Dragged;
+			GatherDraggedActors(SlateApp.GetDragDroppingContent(), Dragged);
+
+			// Anchors are never reparented by this feature.
+			Dragged.RemoveAll([World](const TWeakObjectPtr<AActor>& Weak)
+				{
+					const AActor* Actor = Weak.Get();
+					return !Actor || Actor->GetWorld() != World || !Actor->GetLevel() || Actor->IsA<AAnimOffsetAnim>();
+				});
+
+			// Only interesting when at least one dragged actor is in a sublevel: that is the case Unreal rejects.
+			const bool bAnySublevelActor = Dragged.ContainsByPredicate([](const TWeakObjectPtr<AActor>& Weak)
+				{
+					return !Weak->GetLevel()->IsPersistentLevel();
+				});
+			if (!bAnySublevelActor)
+			{
+				return false;
+			}
+
+			TArray<AAnimOffsetAnim*> Leaders;
+			for (TActorIterator<AAnimOffsetAnim> It(World); It; ++It)
+			{
+				AAnimOffsetAnim* Anchor = *It;
+				if (IsValid(Anchor) && !Anchor->IsTemplate() && !Anchor->bIsFollower
+					&& Anchor->GetLevel() && Anchor->GetLevel()->IsPersistentLevel())
+				{
+					Leaders.Add(Anchor);
+				}
+			}
+			if (Leaders.Num() == 0)
+			{
+				return false;
+			}
+
+			AAnimOffsetAnim* Target = FindLeaderUnderCursor(SlateApp, MouseEvent, World, Leaders);
+			if (!Target)
+			{
+				return false;
+			}
+
+			UE_LOG(LogTemp, Log, TEXT("CameraAnchor: %d actor(s) dropped on '%s' in the Outliner, parenting them to the sublevel anchors."),
+				Dragged.Num(), *Target->GetActorLabel());
+
+			// Run after Slate has finished this (rejected) drop, not in the middle of it.
+			TWeakObjectPtr<AAnimOffsetAnim> WeakTarget(Target);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakTarget, Dragged](float)
+				{
+					if (AAnimOffsetAnim* Leader = WeakTarget.Get())
+					{
+						Leader->ParentDroppedActors(Dragged);
+					}
+					return false; // one shot
+				}), 0.0f);
+
+			return false; // never consume the event: Slate still finishes its own drop handling
+		}
+	};
+
+	TSharedPtr<FOutlinerDropProcessor> GOutlinerDropProcessor;
+	int32 GOutlinerDropUsers = 0;
+}
+
+
+void AAnimOffsetAnim::RegisterOutlinerDropHook()
+{
+	if (HasAnyFlags(RF_ClassDefaultObject) || bOutlinerDropHookRegistered || !FSlateApplication::IsInitialized())
+	{
+		return;
+	}
+	bOutlinerDropHookRegistered = true;
+
+	if (++GOutlinerDropUsers == 1)
+	{
+		GOutlinerDropProcessor = MakeShared<FOutlinerDropProcessor>();
+		FSlateApplication::Get().RegisterInputPreProcessor(GOutlinerDropProcessor);
+	}
+}
+
+
+void AAnimOffsetAnim::UnregisterOutlinerDropHook()
+{
+	if (!bOutlinerDropHookRegistered)
+	{
+		return;
+	}
+	bOutlinerDropHookRegistered = false;
+
+	if (--GOutlinerDropUsers <= 0)
+	{
+		GOutlinerDropUsers = 0;
+		if (GOutlinerDropProcessor.IsValid())
+		{
+			if (FSlateApplication::IsInitialized())
+			{
+				FSlateApplication::Get().UnregisterInputPreProcessor(GOutlinerDropProcessor);
+			}
+			GOutlinerDropProcessor.Reset();
+		}
+	}
+}
+
+
+AAnimOffsetAnim* AAnimOffsetAnim::FindAnchorInLevel(ULevel* Level) const
+{
+	if (!Level)
+	{
+		return nullptr;
+	}
+	for (AActor* Existing : Level->Actors)
+	{
+		AAnimOffsetAnim* Anchor = Cast<AAnimOffsetAnim>(Existing);
+		if (Anchor && Anchor != this && IsValid(Anchor) && !Anchor->IsTemplate())
+		{
+			return Anchor;
+		}
+	}
+	return nullptr;
+}
+
+
+void AAnimOffsetAnim::ParentDroppedActors(const TArray<TWeakObjectPtr<AActor>>& Actors)
+{
+	UWorld* World = GetWorld();
+	if (!GEditor || !World || World->IsGameWorld() || bIsFollower || !GetLevel() || !GetLevel()->IsPersistentLevel())
+	{
+		return;
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("CameraAnchor", "ParentDropped", "Parent To Sublevel Anchor"));
+
+	int32 Parented = 0;
+	for (const TWeakObjectPtr<AActor>& Weak : Actors)
+	{
+		AActor* Actor = Weak.Get();
+		if (!IsValid(Actor) || Actor->IsA<AAnimOffsetAnim>() || !IsActorInLiveLevel(Actor))
+		{
+			continue;
+		}
+
+		// Same level as the leader: the normal parent. Sublevel: the anchor that lives in the actor's own level.
+		AAnimOffsetAnim* Target = nullptr;
+		if (Actor->GetLevel() == GetLevel())
+		{
+			Target = this;
+		}
+		else
+		{
+			Target = FindAnchorInLevel(Actor->GetLevel());
+			if (!Target && bAutoCreateSublevelFollowers)
+			{
+				EnsureSublevelFollowers(true);
+				Target = FindAnchorInLevel(Actor->GetLevel());
+			}
+		}
+
+		if (!Target)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CameraAnchor: '%s' was not parented: its level has no anchor (is the level visible and unlocked?)."),
+				*Actor->GetActorLabel());
+			continue;
+		}
+		if (Actor->GetAttachParentActor() == Target || Target->IsAttachedTo(Actor))
+		{
+			continue; // already there, or it would be a cycle
+		}
+
+		Target->SyncToLeader(); // make sure a follower is exactly on the leader before keeping the world transform
+		Actor->Modify();
+
+		// Same as an Outliner parent: keep where it is in the world. Keys of an animated actor are re-expressed by the
+		// anchor's Sequencer watcher (bKeepWorldOnFirstParent), exactly as when the artist parents it by hand.
+		if (Actor->AttachToActor(Target, FAttachmentTransformRules::KeepWorldTransform))
+		{
+			++Parented;
+		}
+	}
+
+	if (Parented > 0)
+	{
+		FNotificationInfo Info(FText::Format(
+			NSLOCTEXT("CameraAnchor", "ParentedNotice", "Camera Anchor: parented {0} actor(s) to the anchor of their level."),
+			FText::AsNumber(Parented)));
+		Info.ExpireDuration = 4.0f;
+		FSlateNotificationManager::Get().AddNotification(Info);
+	}
 }
 
 

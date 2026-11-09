@@ -68,6 +68,14 @@ public:
 	/** Creates a follower anchor in every loaded sublevel that has no anchor yet (the leader must be in the persistent level). */
 	UFUNCTION(CallInEditor, Category = "Camera Anchor|Sublevels")
 	void CreateSublevelFollowers();
+
+	/**
+	 * Leader only. The actors the artist dropped on this anchor in the World Outliner. Unreal refuses that drop when an actor lives
+	 * in a sublevel (different level), so instead each sublevel actor is parented to the anchor that lives in ITS OWN level
+	 * (the follower, which sits exactly on this leader), keeping its world position. Actors in this anchor's own level
+	 * that were part of the same drag are parented to this anchor. Called by the shared Outliner drop listener.
+	 */
+	void ParentDroppedActors(const TArray<TWeakObjectPtr<AActor>>& Actors);
 #endif
 
 protected:
@@ -198,6 +206,14 @@ private:
 	void EnsureSublevelFollowers(bool bManual);
 
 	bool bFollowerSyncStarted = false;
+
+	/** Registers / releases the single Slate listener (shared by every anchor) that spots Outliner drops onto the leader. */
+	void RegisterOutlinerDropHook();
+	void UnregisterOutlinerDropHook();
+	bool bOutlinerDropHookRegistered = false;
+
+	/** An anchor (normally the follower) that lives in the given level, or null if that level has none. */
+	AAnimOffsetAnim* FindAnchorInLevel(ULevel* Level) const;
 	double NextFollowerCheckTime = 0.0;
 
 	/** One poll of the child watcher. Returns false to stop ticking. */
